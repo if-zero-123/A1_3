@@ -1,0 +1,39 @@
+# Common temp files
+*.swp
+*.swo
+*~
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.d
+
+# CMake/Make generated files
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+install_manifest.txt
+
+# Runtime/log files
+*.log
+
+# Demo binary outputs
+app_demo/**/ssne_ai_demo/ssne_ai_demo
+
+# Linux generated outputs (if building in-tree)
+linux-5.15.24/
+linux-5.15.24/.config
+linux-5.15.24/.config.old
+linux-5.15.24/Module.symvers
+linux-5.15.24/System.map
+linux-5.15.24/vmlinux
+linux-5.15.24/vmlinuz
+linux-5.15.24/.tmp_versions/
