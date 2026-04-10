@@ -9,6 +9,7 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <cmath>
 
 
 /**
@@ -81,10 +82,51 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
 }
 
 /**
+ * @brief 根据检测框绘制近似圆形OSD
+ * @param boxes 检测框向量，每个元素为[xmin, ymin, xmax, ymax]
+ * @description 使用多个小矩形点近似一个圆，用于眼球显示
+ */
+void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
+    printf("Drawing %zu detection circles\n", boxes.size());
+
+    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
+    constexpr float kRadiusScale = 0.42f;
+    constexpr int kNumPoints = 24;
+    constexpr float kPi = 3.14159265358979323846f;
+
+    for (size_t i = 0; i < boxes.size(); i++) {
+        const float x1 = boxes[i][0];
+        const float y1 = boxes[i][1];
+        const float x2 = boxes[i][2];
+        const float y2 = boxes[i][3];
+        const float w = std::max(1.0f, x2 - x1);
+        const float h = std::max(1.0f, y2 - y1);
+        const float cx = (x1 + x2) * 0.5f;
+        const float cy = (y1 + y2) * 0.5f;
+        const float r = std::max(2.0f, kRadiusScale * std::min(w, h));
+
+        for (int p = 0; p < kNumPoints; ++p) {
+            const float theta = (2.0f * kPi * static_cast<float>(p)) / static_cast<float>(kNumPoints);
+            const float px = cx + r * std::cos(theta);
+            const float py = cy + r * std::sin(theta);
+
+            sst::device::osd::OsdQuadRangle q;
+            q.box = {px - 2.0f, py - 2.0f, px + 2.0f, py + 2.0f};
+            q.color = 1;
+            q.border = 1;
+            q.alpha = fdevice::TYPE_ALPHA75;
+            q.type = fdevice::TYPE_HOLLOW;
+            quad_rangle_vec.emplace_back(q);
+        }
+    }
+
+    osd_device.Draw(quad_rangle_vec);
+}
+
+/**
  * @brief 释放OSD可视化器资源
  * @description 清理OSD设备占用的资源
  */
 void VISUALIZER::Release() {
     osd_device.Release();  // 释放OSD设备资源
 }
-

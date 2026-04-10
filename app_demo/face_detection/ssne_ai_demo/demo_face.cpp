@@ -78,12 +78,12 @@ bool check_exit_flag() {
 
 
 /**
- * @brief 推理线程函数：从队列中获取图像并执行人脸检测
+ * @brief 推理线程函数：从队列中获取图像并执行眼睛检测
  */
-void inference_thread_func(SCRFDGRAY* detector, int dual_display_offset_y) {
+void inference_thread_func(EYEDETGRAY* detector, int dual_display_offset_y) {
     cout << "[Thread] Inference thread started!" << endl;
     
-    // 人脸检测结果初始化
+    // 眼睛检测结果初始化
     FaceDetectionResult* det_result1 = new FaceDetectionResult;
     // FaceDetectionResult* det_result2 = new FaceDetectionResult;
     
@@ -115,7 +115,7 @@ void inference_thread_func(SCRFDGRAY* detector, int dual_display_offset_y) {
             continue;
         }
         
-        // 执行人脸检测（非阻塞主循环）
+        // 执行眼睛检测（非阻塞主循环）
         detector->Predict(&img_pair.img1, det_result1, 0.4f);
         // detector->Predict(&img_pair.img2, det_result2, 0.4f);
         
@@ -128,21 +128,21 @@ void inference_thread_func(SCRFDGRAY* detector, int dual_display_offset_y) {
                 float x2_orig = det_result1->boxes[i][2];
                 float y2_orig = det_result1->boxes[i][3];
                 
-                printf("[Frame %d] Right Face detected: (%.2f, %.2f, %.2f, %.2f)\n", 
+                printf("[Frame %d] Right Eye detected: (%.2f, %.2f, %.2f, %.2f)\n", 
                        img_pair.frame_id, x1_orig, y1_orig, x2_orig, y2_orig);
                 // 保存原图坐标用于OSD绘制
                 boxes_original_coord.push_back({x1_orig, y1_orig, x2_orig, y2_orig});
             }
-            // 绘制检测框到OSD
+            // 绘制眼睛圆到OSD
             if (g_visualizer != nullptr) {
-                printf("osd draw\n");
-                g_visualizer->Draw(boxes_original_coord);
+                printf("osd draw circles\n");
+                g_visualizer->DrawCircles(boxes_original_coord);
             }
         } else {
-            // 未检测到人脸，清除OSD上的检测框
+            // 未检测到眼睛，清除OSD上的检测结果
             if (g_visualizer != nullptr) {
                 std::vector<std::array<float, 4>> empty_boxes;
-                g_visualizer->Draw(empty_boxes);  // 传入空向量清除显示
+                g_visualizer->DrawCircles(empty_boxes);  // 传入空向量清除显示
             }
         }
         
@@ -170,7 +170,7 @@ void inference_thread_func(SCRFDGRAY* detector, int dual_display_offset_y) {
 }
 
 /**
- * @brief 人脸检测演示程序主函数
+ * @brief 眼睛检测演示程序主函数
  * @return 执行结果，0表示成功
  */
 int main() {
@@ -184,8 +184,12 @@ int main() {
     int img_height = 480;  // 输入图像高度
     
     // 模型配置参数
-    array<int, 2> det_shape = {640, 480};  // 检测模型输入尺寸
-    string path_det = "/app_demo/app_assets/models/face_640x480.m1model";  // 人脸检测模型路径
+    array<int, 2> eye_det_shape = {640, 480};   // 眼睛检测模型输入尺寸
+    string path_eye_det = "/app_demo/app_assets/models/eye.m1model";
+
+    // 保留后续脸部检测接口，方便分时推理时直接启用
+    array<int, 2> face_det_shape = {640, 480};
+    string path_face_det = "/app_demo/app_assets/models/face_640x480.m1model";
     
     /******************************************************************************************
      * 2. 系统初始化
@@ -212,18 +216,18 @@ int main() {
     IMAGEPROCESSOR processor;
     processor.Initialize(&img_shape);  // 初始化图像处理器（配置原图尺寸）
     
-    // 人脸检测模型初始化
-    SCRFDGRAY detector;
-    int box_len = det_shape[0] * det_shape[1] / 512 * 21;  // 计算最大检测框数量
-    detector.Initialize(path_det, &img_shape, &det_shape, false, box_len);  // 初始化检测器
-    
-    cout << "[INFO] Detection Model initialized!" << endl;    
+    // 当前先启用眼睛检测模型；脸部模型接口保留，后续做分时推理时直接接回
+    EYEDETGRAY eye_detector;
+    int eye_box_len = eye_det_shape[0] * eye_det_shape[1];
+    eye_detector.Initialize(path_eye_det, &img_shape, &eye_det_shape, eye_box_len);
+
+    cout << "[INFO] Eye Detection Model initialized!" << endl;
     // 系统稳定等待
     cout << "sleep for 0.2 second!" << endl;
     sleep(0.2);  // 等待系统稳定
     
     // 启动推理线程
-    std::thread inference_thread(inference_thread_func, &detector, dual_display_offset_y);
+    std::thread inference_thread(inference_thread_func, &eye_detector, dual_display_offset_y);
     cout << "[INFO] Inference thread started!" << endl;
 
     // 创建键盘监听线程
@@ -316,7 +320,7 @@ int main() {
      * 5. 资源释放
      ******************************************************************************************/
     
-    detector.Release();  // 释放检测器资源
+    eye_detector.Release();  // 释放检测器资源
     processor.Release();  // 释放图像处理器资源
     visualizer.Release();  // 释放可视化器资源
     
