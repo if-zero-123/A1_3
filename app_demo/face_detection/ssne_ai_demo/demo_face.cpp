@@ -41,8 +41,11 @@ constexpr float kEyeDisplayScoreThresholdTracked = 0.05f; // 已跟踪后保持�
 constexpr float kEyeMinBoxSize = 2.0f;             // 过滤极小框
 constexpr int kEyeHoldFrames = 4;                  // 短时丢检保持帧数
 constexpr int kClearAfterMissFrames = 12;          // 连续丢检后再清屏，避免闪烁
+constexpr float kEyeDotRatioToFace = 0.11f;        // 眼点半径相对人脸宽比例
+constexpr float kEyeDotMinRadius = 16.0f;          // 眼点最小半径
+constexpr float kEyeDotMaxRadius = 30.0f;          // 眼点最大半径
 constexpr float kFaceInferConfThreshold = 0.45f;   // 人脸检测阈值
-constexpr int kFaceInferInterval = 1;              // 分时推理：先确保效果，当前每帧刷新人脸
+constexpr int kFaceInferInterval = 3;              // 分时推理：降低人脸检测频率提升帧率
 constexpr int kFaceRoiHoldFrames = 10;             // 人脸短时丢检保持
 constexpr float kKalmanQPos = 4.0f;                // 过程噪声（位置）
 constexpr float kKalmanQVel = 1.0f;                // 过程噪声（速度）
@@ -305,6 +308,22 @@ bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) 
     }
     return false;
 }
+
+std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box,
+                                    float face_width,
+                                    float img_w,
+                                    float img_h) {
+    const float cx = 0.5f * (eye_box[0] + eye_box[2]);
+    const float cy = 0.5f * (eye_box[1] + eye_box[3]);
+    const float r = std::max(kEyeDotMinRadius,
+                             std::min(kEyeDotMaxRadius, face_width * kEyeDotRatioToFace));
+    std::array<float, 4> out = {cx - r, cy - r, cx + r, cy + r};
+    out[0] = std::max(0.0f, std::min(out[0], img_w - 1.0f));
+    out[1] = std::max(0.0f, std::min(out[1], img_h - 1.0f));
+    out[2] = std::max(0.0f, std::min(out[2], img_w - 1.0f));
+    out[3] = std::max(0.0f, std::min(out[3], img_h - 1.0f));
+    return out;
+}
 }
 
 
@@ -419,26 +438,30 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         }
 
         // 执行眼睛检测（非阻塞主循环）
-        printf("[DEBUG] Running eye inference...\n");
+        // 眼睛每帧检测，脸框低频刷新并由ROI保持，兼顾稳定与速度
         eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
-        printf("[DEBUG] Eye model output: %zu boxes\n", det_result1->boxes.size());
-        for (size_t i = 0; i < det_result1->boxes.size(); ++i) {
-            const auto& box = det_result1->boxes[i];
-            printf("[DEBUG] Raw box %zu: score=%.3f, coords=[%.1f, %.1f, %.1f, %.1f]\n", 
-                   i, det_result1->scores[i], box[0], box[1], box[2], box[3]);
-        }
         std::vector<std::array<float, 4>> stable_boxes =
             GetStableEyeBoxes(*det_result1,
                               static_cast<float>(img_width),
                               static_cast<float>(img_height));
 
 
-        // 绘制集合：始终优先显示脸框，再叠加眼框
+        // 绘制集合：始终优先显示脸框，再叠加眼点（固定大小风格）
         std::vector<std::array<float, 4>> draw_boxes;
         if (has_face_roi) {
             draw_boxes.push_back(last_face_roi);
         }
-        draw_boxes.insert(draw_boxes.end(), stable_boxes.begin(), stable_boxes.end());
+        const float face_w = has_face_roi ? std::max(1.0f, last_face_roi[2] - last_face_roi[0])
+                                          : 180.0f;
+        std::vector<std::array<float, 4>> eye_dot_boxes;
+        eye_dot_boxes.reserve(stable_boxes.size());
+        for (const auto& b : stable_boxes) {
+            eye_dot_boxes.push_back(BuildEyeDotBox(b,
+                                                   face_w,
+                                                   static_cast<float>(img_width),
+                                                   static_cast<float>(img_height)));
+        }
+        draw_boxes.insert(draw_boxes.end(), eye_dot_boxes.begin(), eye_dot_boxes.end());
 
         // 处理检测结果 - 右侧图像
         if (draw_boxes.empty()) {
@@ -457,18 +480,30 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
 
         g_consecutive_empty_frames = 0;
         if (g_visualizer != nullptr && ShouldRedraw(draw_boxes, img_pair.frame_id)) {
-            if (!stable_boxes.empty()) {
-                for (size_t i = 0; i < stable_boxes.size(); i++) {
+            if (!eye_dot_boxes.empty()) {
+                for (size_t i = 0; i < eye_dot_boxes.size(); i++) {
                     printf("[Frame %d] Stable Eye: (%.2f, %.2f, %.2f, %.2f)\n",
                            img_pair.frame_id,
-                           stable_boxes[i][0],
-                           stable_boxes[i][1],
-                           stable_boxes[i][2],
-                           stable_boxes[i][3]);
+                           eye_dot_boxes[i][0],
+                           eye_dot_boxes[i][1],
+                           eye_dot_boxes[i][2],
+                           eye_dot_boxes[i][3]);
                 }
             }
-            // 当前策略：统一方框显示（脸框+眼框），优先保证可见性和稳定性
-            g_visualizer->Draw(draw_boxes);
+            // 当前策略：脸框显示矩形，眼睛显示大圆点（更接近最终需求）
+            std::vector<std::array<float, 4>> face_draw;
+            std::vector<std::array<float, 4>> eye_draw;
+            if (has_face_roi) {
+                face_draw.push_back(last_face_roi);
+            }
+            eye_draw = eye_dot_boxes;
+
+            g_visualizer->Draw(face_draw);
+            if (g_eye_draw_mode == 0) {
+                g_visualizer->DrawCircles(eye_draw);
+            } else {
+                g_visualizer->Draw(eye_draw);
+            }
             g_last_drawn_boxes = draw_boxes;
             g_last_draw_frame = img_pair.frame_id;
             g_has_active_overlay = true;

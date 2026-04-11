@@ -11,6 +11,8 @@
 #include "../include/utils.hpp"
 
 namespace {
+constexpr bool kEyeVerboseTensorDebug = false;
+
 float Sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
 }
@@ -32,18 +34,23 @@ float BoxCenterY(const std::array<float, 4>& box) {
 }
 
 std::array<float, 4> ShrinkBoxAroundCenter(const std::array<float, 4>& box,
-                                           float ratio,
+                                           float ratio_w,
+                                           float ratio_h,
+                                           float offset_y_ratio,
                                            float max_w,
                                            float max_h) {
     const float cx = 0.5f * (box[0] + box[2]);
     const float cy = 0.5f * (box[1] + box[3]);
-    const float w = std::max(1.0f, box[2] - box[0]) * ratio;
-    const float h = std::max(1.0f, box[3] - box[1]) * ratio;
+    const float src_w = std::max(1.0f, box[2] - box[0]);
+    const float src_h = std::max(1.0f, box[3] - box[1]);
+    const float w = src_w * ratio_w;
+    const float h = src_h * ratio_h;
+    const float cy_shifted = cy - offset_y_ratio * src_h;
     std::array<float, 4> out = {
         cx - 0.5f * w,
-        cy - 0.5f * h,
+        cy_shifted - 0.5f * h,
         cx + 0.5f * w,
-        cy + 0.5f * h,
+        cy_shifted + 0.5f * h,
     };
     out[0] = std::max(0.0f, std::min(out[0], max_w));
     out[1] = std::max(0.0f, std::min(out[1], max_h));
@@ -234,6 +241,9 @@ static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
 }
 
 void PrintClsHeadStats(const char* tag, const float* cls_head, int spatial) {
+    if (!kEyeVerboseTensorDebug) {
+        return;
+    }
     float max_raw = -1e9f;
     float min_raw = 1e9f;
     int max_idx = -1;
@@ -291,7 +301,9 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
                              std::vector<float>* scores,
                              FaceDetectionResult* result,
                              float* conf_threshold) {
-    constexpr float kEyeBoxShrinkRatio = 0.72f;
+    constexpr float kEyeBoxShrinkW = 0.62f;
+    constexpr float kEyeBoxShrinkH = 0.52f;
+    constexpr float kEyeBoxCenterYOffset = 0.08f;
     result->Clear();
     if (boxes->empty()) {
         return;
@@ -344,7 +356,9 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
         box[2] = std::max(0.0f, std::min(box[2] * w_scale, static_cast<float>(img_shape[0])));
         box[3] = std::max(0.0f, std::min(box[3] * h_scale, static_cast<float>(img_shape[1])));
         box = ShrinkBoxAroundCenter(box,
-                                    kEyeBoxShrinkRatio,
+                                    kEyeBoxShrinkW,
+                                    kEyeBoxShrinkH,
+                                    kEyeBoxCenterYOffset,
                                     static_cast<float>(img_shape[0]),
                                     static_cast<float>(img_shape[1]));
         result->boxes.emplace_back(box);
@@ -395,29 +409,33 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
 
     for (int i = 0; i < 6; ++i) {
         uint32_t size = get_total_size(outputs[i]);
-        printf("\n[DEBUG] Output tensor %d total_size: %u elements\n", i, size);
+        if (kEyeVerboseTensorDebug) {
+            printf("\n[DEBUG] Output tensor %d total_size: %u elements\n", i, size);
+        }
         
         uint8_t* raw_u8 = reinterpret_cast<uint8_t*>(get_data(outputs[i]));
         int8_t* raw_s8 = reinterpret_cast<int8_t*>(get_data(outputs[i]));
         float* raw_f32 = reinterpret_cast<float*>(get_data(outputs[i]));
 
-        printf("  -> First 8 bytes (HEX):  ");
-        for (int j = 0; j < 8 && j < size; ++j) {
-            printf("%02X ", raw_u8[j]);
-        }
-        printf("\n");
+        if (kEyeVerboseTensorDebug) {
+            printf("  -> First 8 bytes (HEX):  ");
+            for (int j = 0; j < 8 && j < size; ++j) {
+                printf("%02X ", raw_u8[j]);
+            }
+            printf("\n");
 
-        printf("  -> First 8 values (INT8): ");
-        for (int j = 0; j < 8 && j < size; ++j) {
-            printf("%d ", raw_s8[j]);
-        }
-        printf("\n");
+            printf("  -> First 8 values (INT8): ");
+            for (int j = 0; j < 8 && j < size; ++j) {
+                printf("%d ", raw_s8[j]);
+            }
+            printf("\n");
 
-        printf("  -> First 2 values (F32):  ");
-        for (int j = 0; j < 2 && (j*4) < size; ++j) {
-            printf("%e ", raw_f32[j]);
+            printf("  -> First 2 values (F32):  ");
+            for (int j = 0; j < 2 && (j * 4) < size; ++j) {
+                printf("%e ", raw_f32[j]);
+            }
+            printf("\n");
         }
-        printf("\n");
         
         if (size == exp_cls_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
         else if (size == exp_cls_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));

@@ -13,7 +13,9 @@
 
 namespace {
 // Use a dedicated upper layer to avoid interfering with other OSD content.
-constexpr int kEyeOverlayLayerId = 4;
+constexpr int kEyeBoxLayerId = 4;
+constexpr int kEyeCircleLayerId = 5;
+constexpr bool kOsdVerbose = false;
 }
 
 
@@ -33,7 +35,9 @@ void VISUALIZER::Initialize(std::array<int, 2>& in_img_shape) {
  * @description 在OSD上绘制一个固定位置的测试矩形框
  */
 void VISUALIZER::Draw() {
-    printf("Drawing test rectangle\n");
+    if (kOsdVerbose) {
+        printf("Drawing test rectangle\n");
+    }
     std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
 
 	sst::device::osd::OsdQuadRangle q;
@@ -57,7 +61,9 @@ void VISUALIZER::Draw() {
  * @description 将所有检测到的人脸框绘制到OSD显示层
  */
 void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
-    printf("Drawing %zu detection boxes\n", boxes.size());
+    if (kOsdVerbose) {
+        printf("Drawing %zu detection boxes\n", boxes.size());
+    }
     
     std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;  // OSD矩形框向量
 
@@ -83,7 +89,7 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
     }
 
     // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
-    osd_device.Draw(quad_rangle_vec, kEyeOverlayLayerId);
+    osd_device.Draw(quad_rangle_vec, kEyeBoxLayerId);
 }
 
 /**
@@ -92,7 +98,9 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
  * @description 使用多个小矩形点近似一个圆，用于眼球显示
  */
 void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
-    printf("Drawing %zu detection circles\n", boxes.size());
+    if (kOsdVerbose) {
+        printf("Drawing %zu detection circles\n", boxes.size());
+    }
 
     std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
     constexpr float kRadiusScale = 0.42f;
@@ -126,7 +134,7 @@ void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
     }
 
     // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
-    osd_device.Draw(quad_rangle_vec, kEyeOverlayLayerId);
+    osd_device.Draw(quad_rangle_vec, kEyeCircleLayerId);
 }
 
 /**
