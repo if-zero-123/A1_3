@@ -31,6 +31,27 @@ float BoxCenterY(const std::array<float, 4>& box) {
     return 0.5f * (box[1] + box[3]);
 }
 
+std::array<float, 4> ShrinkBoxAroundCenter(const std::array<float, 4>& box,
+                                           float ratio,
+                                           float max_w,
+                                           float max_h) {
+    const float cx = 0.5f * (box[0] + box[2]);
+    const float cy = 0.5f * (box[1] + box[3]);
+    const float w = std::max(1.0f, box[2] - box[0]) * ratio;
+    const float h = std::max(1.0f, box[3] - box[1]) * ratio;
+    std::array<float, 4> out = {
+        cx - 0.5f * w,
+        cy - 0.5f * h,
+        cx + 0.5f * w,
+        cy + 0.5f * h,
+    };
+    out[0] = std::max(0.0f, std::min(out[0], max_w));
+    out[1] = std::max(0.0f, std::min(out[1], max_h));
+    out[2] = std::max(0.0f, std::min(out[2], max_w));
+    out[3] = std::max(0.0f, std::min(out[3], max_h));
+    return out;
+}
+
 std::vector<int> FilterSmallBoxes(const std::vector<std::array<float, 4>>& boxes,
                                   const std::vector<int>& indices,
                                   float min_box_size) {
@@ -270,6 +291,7 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
                              std::vector<float>* scores,
                              FaceDetectionResult* result,
                              float* conf_threshold) {
+    constexpr float kEyeBoxShrinkRatio = 0.72f;
     result->Clear();
     if (boxes->empty()) {
         return;
@@ -321,6 +343,10 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
         box[1] = std::max(0.0f, std::min(box[1] * h_scale, static_cast<float>(img_shape[1])));
         box[2] = std::max(0.0f, std::min(box[2] * w_scale, static_cast<float>(img_shape[0])));
         box[3] = std::max(0.0f, std::min(box[3] * h_scale, static_cast<float>(img_shape[1])));
+        box = ShrinkBoxAroundCenter(box,
+                                    kEyeBoxShrinkRatio,
+                                    static_cast<float>(img_shape[0]),
+                                    static_cast<float>(img_shape[1]));
         result->boxes.emplace_back(box);
         result->scores.emplace_back(scores->at(idx));
     }
