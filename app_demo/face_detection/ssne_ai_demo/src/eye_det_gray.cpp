@@ -212,6 +212,25 @@ static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
     return res / sum;
 }
 
+void PrintClsHeadStats(const char* tag, const float* cls_head, int spatial) {
+    float max_raw = -1e9f;
+    float min_raw = 1e9f;
+    int max_idx = -1;
+    for (int i = 0; i < spatial; ++i) {
+        const float v = cls_head[i];
+        if (v > max_raw) {
+            max_raw = v;
+            max_idx = i;
+        }
+        if (v < min_raw) {
+            min_raw = v;
+        }
+    }
+    const float max_sigmoid = Sigmoid(max_raw);
+    printf("[DEBUG] %s cls stats: min_raw=%.6f max_raw=%.6f max_sigmoid=%.6f max_idx=%d\n",
+           tag, min_raw, max_raw, max_sigmoid, max_idx);
+}
+
 void EYEDETGRAY::DecodeBranch(const float* cls_head, const float* box_head,
                               int feat_h, int feat_w, int stride,
                               float conf_threshold,
@@ -340,16 +359,39 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
     float* box_s16 = nullptr;
     float* box_s32 = nullptr;
 
-    // Calculate expected sizes in bytes (float32 = 4 bytes)
-    uint32_t exp_cls_s8 = feat_h_s8 * feat_w_s8 * 1 * 4;
-    uint32_t exp_cls_s16 = feat_h_s16 * feat_w_s16 * 1 * 4;
-    uint32_t exp_cls_s32 = feat_h_s32 * feat_w_s32 * 1 * 4;
-    uint32_t exp_box_s8 = feat_h_s8 * feat_w_s8 * 64 * 4;
-    uint32_t exp_box_s16 = feat_h_s16 * feat_w_s16 * 64 * 4;
-    uint32_t exp_box_s32 = feat_h_s32 * feat_w_s32 * 64 * 4;
+    // NOTE: get_total_size() on this SDK returns element count (not byte count).
+    uint32_t exp_cls_s8 = feat_h_s8 * feat_w_s8 * 1;
+    uint32_t exp_cls_s16 = feat_h_s16 * feat_w_s16 * 1;
+    uint32_t exp_cls_s32 = feat_h_s32 * feat_w_s32 * 1;
+    uint32_t exp_box_s8 = feat_h_s8 * feat_w_s8 * 64;
+    uint32_t exp_box_s16 = feat_h_s16 * feat_w_s16 * 64;
+    uint32_t exp_box_s32 = feat_h_s32 * feat_w_s32 * 64;
 
     for (int i = 0; i < 6; ++i) {
         uint32_t size = get_total_size(outputs[i]);
+        printf("\n[DEBUG] Output tensor %d total_size: %u elements\n", i, size);
+        
+        uint8_t* raw_u8 = reinterpret_cast<uint8_t*>(get_data(outputs[i]));
+        int8_t* raw_s8 = reinterpret_cast<int8_t*>(get_data(outputs[i]));
+        float* raw_f32 = reinterpret_cast<float*>(get_data(outputs[i]));
+
+        printf("  -> First 8 bytes (HEX):  ");
+        for (int j = 0; j < 8 && j < size; ++j) {
+            printf("%02X ", raw_u8[j]);
+        }
+        printf("\n");
+
+        printf("  -> First 8 values (INT8): ");
+        for (int j = 0; j < 8 && j < size; ++j) {
+            printf("%d ", raw_s8[j]);
+        }
+        printf("\n");
+
+        printf("  -> First 2 values (F32):  ");
+        for (int j = 0; j < 2 && (j*4) < size; ++j) {
+            printf("%e ", raw_f32[j]);
+        }
+        printf("\n");
         
         if (size == exp_cls_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
         else if (size == exp_cls_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
@@ -360,9 +402,15 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
     }
     
     if (!cls_s8 || !cls_s16 || !cls_s32 || !box_s8 || !box_s16 || !box_s32) {
-        printf("[ERROR] Output tensor size mismatch! Check if the outputs match 6 YOLOv8 heads.\n");
+        printf("[ERROR] Output tensor size mismatch!\n");
+        printf("Expected total_size (elements): cls(%u, %u, %u), box(%u, %u, %u)\n", 
+               exp_cls_s8, exp_cls_s16, exp_cls_s32, exp_box_s8, exp_box_s16, exp_box_s32);
         return;
     }
+
+    PrintClsHeadStats("S8", cls_s8, feat_h_s8 * feat_w_s8);
+    PrintClsHeadStats("S16", cls_s16, feat_h_s16 * feat_w_s16);
+    PrintClsHeadStats("S32", cls_s32, feat_h_s32 * feat_w_s32);
 
     DecodeBranch(cls_s8, box_s8, feat_h_s8, feat_w_s8, 8, conf_threshold, &bboxes, &scores);
     DecodeBranch(cls_s16, box_s16, feat_h_s16, feat_w_s16, 16, conf_threshold, &bboxes, &scores);
