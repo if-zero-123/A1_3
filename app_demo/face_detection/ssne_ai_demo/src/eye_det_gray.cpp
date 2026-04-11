@@ -155,8 +155,8 @@ void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_
     nms_threshold = 0.25f;
     keep_top_k = 2;
     top_k = 12;
-    eye_pair_only = true;
-    min_box_size = 8.0f;
+    eye_pair_only = false;
+    min_box_size = 2.0f;
     pair_candidates = 12;
     pair_y_thresh = 1.5f;
     pair_size_ratio_thresh = 2.5f;
@@ -192,6 +192,26 @@ void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_
     }
 }
 
+
+static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
+    float max_val = -1e9f;
+    for (int i = 0; i < 16; ++i) {
+        float val = tensor[(start_channel + i) * spatial + idx];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float sum = 0.0f;
+    float res = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        float weight = std::exp(tensor[(start_channel + i) * spatial + idx] - max_val);
+        sum += weight;
+        res += weight * static_cast<float>(i);
+    }
+    return res / sum;
+}
+
 void EYEDETGRAY::DecodeBranch(const float* cls_head, const float* box_head,
                               int feat_h, int feat_w, int stride,
                               float conf_threshold,
@@ -208,10 +228,10 @@ void EYEDETGRAY::DecodeBranch(const float* cls_head, const float* box_head,
 
             const float cx = (static_cast<float>(x) + 0.5f) * stride;
             const float cy = (static_cast<float>(y) + 0.5f) * stride;
-            const float l = box_head[idx];
-            const float t = box_head[spatial + idx];
-            const float r = box_head[2 * spatial + idx];
-            const float b = box_head[3 * spatial + idx];
+            const float l = DFL(box_head, 0, spatial, idx) * stride;
+            const float t = DFL(box_head, 16, spatial, idx) * stride;
+            const float r = DFL(box_head, 32, spatial, idx) * stride;
+            const float b = DFL(box_head, 48, spatial, idx) * stride;
 
             float x1 = std::max(0.0f, cx - l);
             float y1 = std::max(0.0f, cy - t);
@@ -313,12 +333,32 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
     const int feat_h_s32 = det_shape[1] / 32;
     const int feat_w_s32 = det_shape[0] / 32;
 
-    float* cls_s8 = reinterpret_cast<float*>(get_data(outputs[0]));
-    float* cls_s16 = reinterpret_cast<float*>(get_data(outputs[1]));
-    float* cls_s32 = reinterpret_cast<float*>(get_data(outputs[2]));
-    float* box_s8 = reinterpret_cast<float*>(get_data(outputs[3]));
-    float* box_s16 = reinterpret_cast<float*>(get_data(outputs[4]));
-    float* box_s32 = reinterpret_cast<float*>(get_data(outputs[5]));
+    float* cls_s8 = nullptr;
+    float* cls_s16 = nullptr;
+    float* cls_s32 = nullptr;
+    float* box_s8 = nullptr;
+    float* box_s16 = nullptr;
+    float* box_s32 = nullptr;
+
+    for (int i = 0; i < 6; ++i) {
+        uint32_t n, c, h, w;
+        get_tensor_shape(outputs[i], &n, &c, &h, &w);
+        
+        if (c == 1) { // cls heads
+            if (w == feat_w_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
+            else if (w == feat_w_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
+            else if (w == feat_w_s32) cls_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
+        } else if (c == 64) { // box heads
+            if (w == feat_w_s8) box_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
+            else if (w == feat_w_s16) box_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
+            else if (w == feat_w_s32) box_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
+        }
+    }
+    
+    if (!cls_s8 || !cls_s16 || !cls_s32 || !box_s8 || !box_s16 || !box_s32) {
+        printf("[ERROR] Output tensor shape mismatch! Ensure model outputs 3x cls (c=1) and 3x box (c=64)\n");
+        return;
+    }
 
     DecodeBranch(cls_s8, box_s8, feat_h_s8, feat_w_s8, 8, conf_threshold, &bboxes, &scores);
     DecodeBranch(cls_s16, box_s16, feat_h_s16, feat_w_s16, 16, conf_threshold, &bboxes, &scores);

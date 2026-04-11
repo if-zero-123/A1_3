@@ -35,10 +35,10 @@ std::atomic<int> g_eye_draw_mode(1);             // 0: circle, 1: box
 VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
 
 namespace {
-constexpr float kEyeInferConfThreshold = 0.30f;    // 推理阈值（进一步放宽，优先提升召回）
-constexpr float kEyeDisplayScoreThreshold = 0.35f; // 首次显示阈值
-constexpr float kEyeDisplayScoreThresholdTracked = 0.20f; // 已跟踪后保持阈值
-constexpr float kEyeMinBoxSize = 8.0f;             // 过滤极小框
+constexpr float kEyeInferConfThreshold = 0.05f;    // 推理阈值（进一步放宽，优先提升召回）
+constexpr float kEyeDisplayScoreThreshold = 0.10f; // 首次显示阈值
+constexpr float kEyeDisplayScoreThresholdTracked = 0.05f; // 已跟踪后保持阈值
+constexpr float kEyeMinBoxSize = 2.0f;             // 过滤极小框
 constexpr int kEyeHoldFrames = 4;                  // 短时丢检保持帧数
 constexpr int kClearAfterMissFrames = 12;          // 连续丢检后再清屏，避免闪烁
 constexpr float kFaceInferConfThreshold = 0.45f;   // 人脸检测阈值
@@ -419,23 +419,19 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         }
 
         // 执行眼睛检测（非阻塞主循环）
+        printf("[DEBUG] Running eye inference...\n");
         eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
+        printf("[DEBUG] Eye model output: %zu boxes\n", det_result1->boxes.size());
+        for (size_t i = 0; i < det_result1->boxes.size(); ++i) {
+            const auto& box = det_result1->boxes[i];
+            printf("[DEBUG] Raw box %zu: score=%.3f, coords=[%.1f, %.1f, %.1f, %.1f]\n", 
+                   i, det_result1->scores[i], box[0], box[1], box[2], box[3]);
+        }
         std::vector<std::array<float, 4>> stable_boxes =
             GetStableEyeBoxes(*det_result1,
                               static_cast<float>(img_width),
                               static_cast<float>(img_height));
 
-        // 在人脸ROI内约束眼睛结果，减少杂点误检
-        if (has_face_roi) {
-            stable_boxes = FilterEyesByFaceRoi(
-                stable_boxes,
-                last_face_roi,
-                static_cast<float>(img_width),
-                static_cast<float>(img_height));
-        } else {
-            // 用户目标：先脸后眼。没有脸ROI时不显示眼睛框。
-            stable_boxes.clear();
-        }
 
         // 绘制集合：始终优先显示脸框，再叠加眼框
         std::vector<std::array<float, 4>> draw_boxes;
