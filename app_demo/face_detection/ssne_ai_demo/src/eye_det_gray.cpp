@@ -340,23 +340,27 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
     float* box_s16 = nullptr;
     float* box_s32 = nullptr;
 
+    // Calculate expected sizes in bytes (float32 = 4 bytes)
+    uint32_t exp_cls_s8 = feat_h_s8 * feat_w_s8 * 1 * 4;
+    uint32_t exp_cls_s16 = feat_h_s16 * feat_w_s16 * 1 * 4;
+    uint32_t exp_cls_s32 = feat_h_s32 * feat_w_s32 * 1 * 4;
+    uint32_t exp_box_s8 = feat_h_s8 * feat_w_s8 * 64 * 4;
+    uint32_t exp_box_s16 = feat_h_s16 * feat_w_s16 * 64 * 4;
+    uint32_t exp_box_s32 = feat_h_s32 * feat_w_s32 * 64 * 4;
+
     for (int i = 0; i < 6; ++i) {
-        uint32_t n, c, h, w;
-        get_tensor_shape(outputs[i], &n, &c, &h, &w);
+        uint32_t size = get_total_size(outputs[i]);
         
-        if (c == 1) { // cls heads
-            if (w == feat_w_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
-            else if (w == feat_w_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
-            else if (w == feat_w_s32) cls_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
-        } else if (c == 64) { // box heads
-            if (w == feat_w_s8) box_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
-            else if (w == feat_w_s16) box_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
-            else if (w == feat_w_s32) box_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
-        }
+        if (size == exp_cls_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
+        else if (size == exp_cls_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
+        else if (size == exp_cls_s32) cls_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
+        else if (size == exp_box_s8) box_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
+        else if (size == exp_box_s16) box_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
+        else if (size == exp_box_s32) box_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
     }
     
     if (!cls_s8 || !cls_s16 || !cls_s32 || !box_s8 || !box_s16 || !box_s32) {
-        printf("[ERROR] Output tensor shape mismatch! Ensure model outputs 3x cls (c=1) and 3x box (c=64)\n");
+        printf("[ERROR] Output tensor size mismatch! Check if the outputs match 6 YOLOv8 heads.\n");
         return;
     }
 

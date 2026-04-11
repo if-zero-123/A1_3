@@ -513,7 +513,7 @@ int main(int argc, char* argv[]) {
     
     // 模型配置参数
     array<int, 2> eye_det_shape = {640, 480};   // 眼睛检测模型输入尺寸
-    string path_eye_det = "/app_demo/app_assets/models/eye2.m1model";
+    string path_eye_det = "/app_demo/app_assets/models/eye.m1model";
 
     // OSD眼睛绘制模式：默认box，可通过环境变量或命令行切换为circle
     // 优先级：CLI(--eye-draw=...) > ENV(EYE_DRAW_MODE) > default(box)
