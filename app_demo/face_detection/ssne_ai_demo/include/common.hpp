@@ -189,6 +189,13 @@ class EYEDETGRAY {
     float h_scale;
     std::vector<int> steps;
 
+    // eye postprocess params (aligned with training-side decode)
+    bool eye_pair_only;
+    float min_box_size;
+    int pair_candidates;
+    float pair_y_thresh;
+    float pair_size_ratio_thresh;
+
     void Release();
 
   private:

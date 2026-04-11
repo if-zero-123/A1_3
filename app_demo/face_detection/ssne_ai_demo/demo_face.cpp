@@ -8,15 +8,20 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <fcntl.h>
 #include <regex>
-#include <dirent.h>
-#include <unistd.h>
 #include <thread>
+#include <chrono>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <queue>
+#include <utility>
+#include <limits>
 #include "include/utils.hpp"
 
 using namespace std;
@@ -26,7 +31,281 @@ std::mutex mtx_image;                           // 图像队列互斥锁
 std::condition_variable cv_image_ready;          // 图像就绪条件变量
 std::atomic<bool> stop_inference(false);         // 停止推理标志
 std::atomic<int> frame_count(0);                 // 帧计数器
+std::atomic<int> g_eye_draw_mode(1);             // 0: circle, 1: box
 VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
+
+namespace {
+constexpr float kEyeInferConfThreshold = 0.30f;    // 推理阈值（进一步放宽，优先提升召回）
+constexpr float kEyeDisplayScoreThreshold = 0.35f; // 首次显示阈值
+constexpr float kEyeDisplayScoreThresholdTracked = 0.20f; // 已跟踪后保持阈值
+constexpr float kEyeMinBoxSize = 8.0f;             // 过滤极小框
+constexpr int kEyeHoldFrames = 4;                  // 短时丢检保持帧数
+constexpr int kClearAfterMissFrames = 12;          // 连续丢检后再清屏，避免闪烁
+constexpr float kFaceInferConfThreshold = 0.45f;   // 人脸检测阈值
+constexpr int kFaceInferInterval = 1;              // 分时推理：先确保效果，当前每帧刷新人脸
+constexpr int kFaceRoiHoldFrames = 10;             // 人脸短时丢检保持
+constexpr float kKalmanQPos = 4.0f;                // 过程噪声（位置）
+constexpr float kKalmanQVel = 1.0f;                // 过程噪声（速度）
+constexpr float kKalmanR = 16.0f;                  // 观测噪声
+
+struct AxisKalman {
+    bool initialized = false;
+    float x = 0.0f;
+    float v = 0.0f;
+    float p00 = 1.0f;
+    float p01 = 0.0f;
+    float p10 = 0.0f;
+    float p11 = 1.0f;
+
+    void Init(float z) {
+        initialized = true;
+        x = z;
+        v = 0.0f;
+        p00 = 10.0f;
+        p01 = 0.0f;
+        p10 = 0.0f;
+        p11 = 10.0f;
+    }
+
+    void Predict(float q_pos, float q_vel) {
+        if (!initialized) {
+            return;
+        }
+        x += v;
+        const float n00 = p00 + p01 + p10 + p11 + q_pos;
+        const float n01 = p01 + p11;
+        const float n10 = p10 + p11;
+        const float n11 = p11 + q_vel;
+        p00 = n00;
+        p01 = n01;
+        p10 = n10;
+        p11 = n11;
+    }
+
+    void Update(float z, float r) {
+        if (!initialized) {
+            Init(z);
+            return;
+        }
+        const float y = z - x;
+        const float s = p00 + r;
+        const float k0 = p00 / s;
+        const float k1 = p10 / s;
+        x += k0 * y;
+        v += k1 * y;
+
+        const float o00 = p00;
+        const float o01 = p01;
+        const float o10 = p10;
+        const float o11 = p11;
+        p00 = (1.0f - k0) * o00;
+        p01 = (1.0f - k0) * o01;
+        p10 = o10 - k1 * o00;
+        p11 = o11 - k1 * o01;
+    }
+};
+
+struct EyeTrack {
+    AxisKalman cx;
+    AxisKalman cy;
+    AxisKalman w;
+    AxisKalman h;
+    int miss = 0;
+
+    bool IsReady() const {
+        return cx.initialized && cy.initialized && w.initialized && h.initialized;
+    }
+
+    void Predict() {
+        cx.Predict(kKalmanQPos, kKalmanQVel);
+        cy.Predict(kKalmanQPos, kKalmanQVel);
+        w.Predict(kKalmanQPos, kKalmanQVel);
+        h.Predict(kKalmanQPos, kKalmanQVel);
+    }
+
+    void UpdateWithBox(const std::array<float, 4>& box) {
+        const float bw = std::max(1.0f, box[2] - box[0]);
+        const float bh = std::max(1.0f, box[3] - box[1]);
+        const float bx = 0.5f * (box[0] + box[2]);
+        const float by = 0.5f * (box[1] + box[3]);
+
+        Predict();
+        cx.Update(bx, kKalmanR);
+        cy.Update(by, kKalmanR);
+        w.Update(bw, kKalmanR);
+        h.Update(bh, kKalmanR);
+        miss = 0;
+    }
+
+    std::array<float, 4> ToBox() const {
+        const float bw = std::max(1.0f, w.x);
+        const float bh = std::max(1.0f, h.x);
+        const float x1 = cx.x - 0.5f * bw;
+        const float y1 = cy.x - 0.5f * bh;
+        const float x2 = cx.x + 0.5f * bw;
+        const float y2 = cy.x + 0.5f * bh;
+        return {x1, y1, x2, y2};
+    }
+};
+
+EyeTrack g_eye_tracks[2];
+std::vector<std::array<float, 4>> g_last_drawn_boxes;
+int g_last_draw_frame = -10000;
+bool g_has_active_overlay = false;
+int g_consecutive_empty_frames = 0;
+
+bool SelectPrimaryFaceRoi(const FaceDetectionResult& face_result,
+                          std::array<float, 4>* face_box_out) {
+    if (face_result.boxes.empty() || face_result.scores.empty()) {
+        return false;
+    }
+    size_t best_idx = 0;
+    float best_score = -std::numeric_limits<float>::infinity();
+    const size_t n = std::min(face_result.boxes.size(), face_result.scores.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (face_result.scores[i] > best_score) {
+            best_score = face_result.scores[i];
+            best_idx = i;
+        }
+    }
+    *face_box_out = face_result.boxes[best_idx];
+    return true;
+}
+
+std::vector<std::array<float, 4>> FilterEyesByFaceRoi(
+    const std::vector<std::array<float, 4>>& eye_boxes,
+    const std::array<float, 4>& face_box,
+    float img_w,
+    float img_h) {
+    const float fx1 = std::max(0.0f, std::min(face_box[0], img_w - 1.0f));
+    const float fy1 = std::max(0.0f, std::min(face_box[1], img_h - 1.0f));
+    const float fx2 = std::max(0.0f, std::min(face_box[2], img_w - 1.0f));
+    const float fy2 = std::max(0.0f, std::min(face_box[3], img_h - 1.0f));
+    const float fw = std::max(1.0f, fx2 - fx1);
+    const float fh = std::max(1.0f, fy2 - fy1);
+
+    const float roi_x1 = std::max(0.0f, fx1 - 0.08f * fw);
+    const float roi_x2 = std::min(img_w - 1.0f, fx2 + 0.08f * fw);
+    const float roi_y1 = std::max(0.0f, fy1 - 0.05f * fh);
+    const float roi_y2 = std::min(img_h - 1.0f, fy1 + 0.62f * fh);
+
+    std::vector<std::array<float, 4>> filtered;
+    filtered.reserve(eye_boxes.size());
+    for (const auto& box : eye_boxes) {
+        const float bw = std::max(1.0f, box[2] - box[0]);
+        const float bh = std::max(1.0f, box[3] - box[1]);
+        const float cx = 0.5f * (box[0] + box[2]);
+        const float cy = 0.5f * (box[1] + box[3]);
+
+        const bool in_roi = (cx >= roi_x1 && cx <= roi_x2 && cy >= roi_y1 && cy <= roi_y2);
+        const bool size_ok = (bw <= 0.80f * fw && bh <= 0.80f * fh);
+        if (in_roi && size_ok) {
+            filtered.push_back(box);
+        }
+    }
+    return filtered;
+}
+
+std::array<float, 4> ClampBoxToImage(const std::array<float, 4>& box,
+                                     float img_w,
+                                     float img_h) {
+    std::array<float, 4> out = box;
+    out[0] = std::max(0.0f, std::min(out[0], img_w - 1.0f));
+    out[1] = std::max(0.0f, std::min(out[1], img_h - 1.0f));
+    out[2] = std::max(0.0f, std::min(out[2], img_w - 1.0f));
+    out[3] = std::max(0.0f, std::min(out[3], img_h - 1.0f));
+    if (out[2] < out[0]) std::swap(out[2], out[0]);
+    if (out[3] < out[1]) std::swap(out[3], out[1]);
+    return out;
+}
+
+float CenterX(const std::array<float, 4>& box) {
+    return 0.5f * (box[0] + box[2]);
+}
+
+std::vector<std::array<float, 4>> SortByCenterX(
+    std::vector<std::array<float, 4>> boxes) {
+    std::sort(boxes.begin(), boxes.end(), [](const std::array<float, 4>& a,
+                                             const std::array<float, 4>& b) {
+        return CenterX(a) < CenterX(b);
+    });
+    return boxes;
+}
+
+std::vector<std::array<float, 4>> GetStableEyeBoxes(
+    const FaceDetectionResult& result,
+    float img_w,
+    float img_h) {
+    const bool has_track = g_eye_tracks[0].IsReady() || g_eye_tracks[1].IsReady();
+    const float score_thresh = has_track ? kEyeDisplayScoreThresholdTracked : kEyeDisplayScoreThreshold;
+    std::vector<std::pair<std::array<float, 4>, float>> candidates;
+    candidates.reserve(result.boxes.size());
+    for (size_t i = 0; i < result.boxes.size(); ++i) {
+        const float score = (i < result.scores.size()) ? result.scores[i] : 1.0f;
+        const auto& box = result.boxes[i];
+        const float bw = std::max(0.0f, box[2] - box[0]);
+        const float bh = std::max(0.0f, box[3] - box[1]);
+        if (score >= score_thresh && bw >= kEyeMinBoxSize && bh >= kEyeMinBoxSize) {
+            candidates.push_back({box, score});
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const std::pair<std::array<float, 4>, float>& a,
+                 const std::pair<std::array<float, 4>, float>& b) {
+                  return a.second > b.second;
+              });
+    if (candidates.size() > 2) {
+        candidates.resize(2);
+    }
+
+    std::vector<std::array<float, 4>> current;
+    current.reserve(candidates.size());
+    for (const auto& item : candidates) {
+        current.push_back(item.first);
+    }
+    current = SortByCenterX(current);
+
+    for (int i = 0; i < 2; ++i) {
+        if (i < static_cast<int>(current.size())) {
+            g_eye_tracks[i].UpdateWithBox(current[i]);
+            continue;
+        }
+        if (g_eye_tracks[i].IsReady()) {
+            g_eye_tracks[i].Predict();
+            g_eye_tracks[i].miss += 1;
+        }
+    }
+
+    std::vector<std::array<float, 4>> stable;
+    stable.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+        if (g_eye_tracks[i].IsReady() && g_eye_tracks[i].miss <= kEyeHoldFrames) {
+            stable.push_back(ClampBoxToImage(g_eye_tracks[i].ToBox(), img_w, img_h));
+        }
+    }
+    return SortByCenterX(stable);
+}
+
+bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) {
+    if (g_last_draw_frame < 0) {
+        return true;
+    }
+    if (boxes.size() != g_last_drawn_boxes.size()) {
+        return true;
+    }
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        const float dx = std::fabs(CenterX(boxes[i]) - CenterX(g_last_drawn_boxes[i]));
+        const float dy = std::fabs((boxes[i][1] + boxes[i][3]) * 0.5f - (g_last_drawn_boxes[i][1] + g_last_drawn_boxes[i][3]) * 0.5f);
+        const float dw = std::fabs((boxes[i][2] - boxes[i][0]) - (g_last_drawn_boxes[i][2] - g_last_drawn_boxes[i][0]));
+        const float dh = std::fabs((boxes[i][3] - boxes[i][1]) - (g_last_drawn_boxes[i][3] - g_last_drawn_boxes[i][1]));
+        if (dx > 2.0f || dy > 2.0f || dw > 2.0f || dh > 2.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+}
 
 
 // 图像队列结构
@@ -80,12 +359,19 @@ bool check_exit_flag() {
 /**
  * @brief 推理线程函数：从队列中获取图像并执行眼睛检测
  */
-void inference_thread_func(EYEDETGRAY* detector, int dual_display_offset_y) {
+void inference_thread_func(EYEDETGRAY* eye_detector,
+                           SCRFDGRAY* face_detector,
+                           int dual_display_offset_y,
+                           int img_width,
+                           int img_height) {
     cout << "[Thread] Inference thread started!" << endl;
     
     // 眼睛检测结果初始化
     FaceDetectionResult* det_result1 = new FaceDetectionResult;
-    // FaceDetectionResult* det_result2 = new FaceDetectionResult;
+    FaceDetectionResult* face_result = new FaceDetectionResult;
+    std::array<float, 4> last_face_roi = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool has_face_roi = false;
+    int face_miss_frames = 0;
     
     while (!stop_inference) {
         ImagePair img_pair;
@@ -115,35 +401,81 @@ void inference_thread_func(EYEDETGRAY* detector, int dual_display_offset_y) {
             continue;
         }
         
+        // 分时推理：先脸后眼。人脸低频刷新，眼睛每帧运行。
+        if (face_detector != nullptr &&
+            ((img_pair.frame_id % kFaceInferInterval) == 0 || !has_face_roi)) {
+            face_detector->Predict(&img_pair.img1, face_result, kFaceInferConfThreshold);
+            std::array<float, 4> current_face_roi;
+            if (SelectPrimaryFaceRoi(*face_result, &current_face_roi)) {
+                last_face_roi = current_face_roi;
+                has_face_roi = true;
+                face_miss_frames = 0;
+            } else if (has_face_roi) {
+                face_miss_frames += 1;
+                if (face_miss_frames > kFaceRoiHoldFrames) {
+                    has_face_roi = false;
+                }
+            }
+        }
+
         // 执行眼睛检测（非阻塞主循环）
-        detector->Predict(&img_pair.img1, det_result1, 0.4f);
-        // detector->Predict(&img_pair.img2, det_result2, 0.4f);
-        
-        // 处理检测结果 - 右侧图像
-        if (det_result1->boxes.size() > 0) {
-            std::vector<std::array<float, 4>> boxes_original_coord;  // 存储转换后的原图坐标
-            for (size_t i = 0; i < det_result1->boxes.size(); i++) {
-                float x1_orig = det_result1->boxes[i][0];
-                float y1_orig = det_result1->boxes[i][1];
-                float x2_orig = det_result1->boxes[i][2];
-                float y2_orig = det_result1->boxes[i][3];
-                
-                printf("[Frame %d] Right Eye detected: (%.2f, %.2f, %.2f, %.2f)\n", 
-                       img_pair.frame_id, x1_orig, y1_orig, x2_orig, y2_orig);
-                // 保存原图坐标用于OSD绘制
-                boxes_original_coord.push_back({x1_orig, y1_orig, x2_orig, y2_orig});
-            }
-            // 绘制眼睛圆到OSD
-            if (g_visualizer != nullptr) {
-                printf("osd draw circles\n");
-                g_visualizer->DrawCircles(boxes_original_coord);
-            }
+        eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
+        std::vector<std::array<float, 4>> stable_boxes =
+            GetStableEyeBoxes(*det_result1,
+                              static_cast<float>(img_width),
+                              static_cast<float>(img_height));
+
+        // 在人脸ROI内约束眼睛结果，减少杂点误检
+        if (has_face_roi) {
+            stable_boxes = FilterEyesByFaceRoi(
+                stable_boxes,
+                last_face_roi,
+                static_cast<float>(img_width),
+                static_cast<float>(img_height));
         } else {
-            // 未检测到眼睛，清除OSD上的检测结果
-            if (g_visualizer != nullptr) {
+            // 用户目标：先脸后眼。没有脸ROI时不显示眼睛框。
+            stable_boxes.clear();
+        }
+
+        // 绘制集合：始终优先显示脸框，再叠加眼框
+        std::vector<std::array<float, 4>> draw_boxes;
+        if (has_face_roi) {
+            draw_boxes.push_back(last_face_roi);
+        }
+        draw_boxes.insert(draw_boxes.end(), stable_boxes.begin(), stable_boxes.end());
+
+        // 处理检测结果 - 右侧图像
+        if (draw_boxes.empty()) {
+            g_consecutive_empty_frames += 1;
+            if (g_visualizer != nullptr && g_has_active_overlay &&
+                g_consecutive_empty_frames >= kClearAfterMissFrames) {
                 std::vector<std::array<float, 4>> empty_boxes;
-                g_visualizer->DrawCircles(empty_boxes);  // 传入空向量清除显示
+                g_visualizer->Draw(empty_boxes);
+                g_has_active_overlay = false;
+                g_last_drawn_boxes.clear();
+                g_last_draw_frame = img_pair.frame_id;
+                g_consecutive_empty_frames = 0;
             }
+            continue;
+        }
+
+        g_consecutive_empty_frames = 0;
+        if (g_visualizer != nullptr && ShouldRedraw(draw_boxes, img_pair.frame_id)) {
+            if (!stable_boxes.empty()) {
+                for (size_t i = 0; i < stable_boxes.size(); i++) {
+                    printf("[Frame %d] Stable Eye: (%.2f, %.2f, %.2f, %.2f)\n",
+                           img_pair.frame_id,
+                           stable_boxes[i][0],
+                           stable_boxes[i][1],
+                           stable_boxes[i][2],
+                           stable_boxes[i][3]);
+                }
+            }
+            // 当前策略：统一方框显示（脸框+眼框），优先保证可见性和稳定性
+            g_visualizer->Draw(draw_boxes);
+            g_last_drawn_boxes = draw_boxes;
+            g_last_draw_frame = img_pair.frame_id;
+            g_has_active_overlay = true;
         }
         
         // // 处理检测结果 - 左侧图像
@@ -164,7 +496,7 @@ void inference_thread_func(EYEDETGRAY* detector, int dual_display_offset_y) {
     
     // 释放资源
     delete det_result1;
-    // delete det_result2;
+    delete face_result;
     
     cout << "[Thread] Inference thread stopped!" << endl;
 }
@@ -173,7 +505,7 @@ void inference_thread_func(EYEDETGRAY* detector, int dual_display_offset_y) {
  * @brief 眼睛检测演示程序主函数
  * @return 执行结果，0表示成功
  */
-int main() {
+int main(int argc, char* argv[]) {
     /******************************************************************************************
      * 1. 参数配置
      ******************************************************************************************/
@@ -185,7 +517,42 @@ int main() {
     
     // 模型配置参数
     array<int, 2> eye_det_shape = {640, 480};   // 眼睛检测模型输入尺寸
-    string path_eye_det = "/app_demo/app_assets/models/eye.m1model";
+    string path_eye_det = "/app_demo/app_assets/models/eye2.m1model";
+
+    // OSD眼睛绘制模式：默认box，可通过环境变量或命令行切换为circle
+    // 优先级：CLI(--eye-draw=...) > ENV(EYE_DRAW_MODE) > default(box)
+    std::string eye_draw_mode = "box";
+    auto to_lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return s;
+    };
+    const char* env_draw_mode = std::getenv("EYE_DRAW_MODE");
+    if (env_draw_mode != nullptr) {
+        eye_draw_mode = env_draw_mode;
+    }
+    for (int i = 1; i < argc; ++i) {
+        if (std::strncmp(argv[i], "--eye-draw=", 11) == 0) {
+            eye_draw_mode = std::string(argv[i] + 11);
+        } else if (std::strncmp(argv[i], "--eye-draw-mode=", 16) == 0) {
+            // backward-compatible alias
+            eye_draw_mode = std::string(argv[i] + 16);
+        } else if (std::strncmp(argv[i], "--draw-mode=", 12) == 0) {
+            // backward-compatible alias
+            eye_draw_mode = std::string(argv[i] + 12);
+        }
+    }
+    eye_draw_mode = to_lower(eye_draw_mode);
+    if (eye_draw_mode == "circle" || eye_draw_mode == "0") {
+        g_eye_draw_mode = 0;
+    } else if (eye_draw_mode == "box" || eye_draw_mode == "1") {
+        g_eye_draw_mode = 1;
+    } else {
+        g_eye_draw_mode = 1;
+        eye_draw_mode = "box";
+    }
+    printf("[INFO] Eye draw mode: %s\n", eye_draw_mode.c_str());
 
     // 保留后续脸部检测接口，方便分时推理时直接启用
     array<int, 2> face_det_shape = {640, 480};
@@ -216,18 +583,27 @@ int main() {
     IMAGEPROCESSOR processor;
     processor.Initialize(&img_shape);  // 初始化图像处理器（配置原图尺寸）
     
-    // 当前先启用眼睛检测模型；脸部模型接口保留，后续做分时推理时直接接回
+    // 启用脸部+眼睛：分时推理（先脸后眼）
+    SCRFDGRAY face_detector;
+    int face_box_len = face_det_shape[0] * face_det_shape[1];
+    face_detector.Initialize(path_face_det, &img_shape, &face_det_shape, false, face_box_len);
+
     EYEDETGRAY eye_detector;
     int eye_box_len = eye_det_shape[0] * eye_det_shape[1];
     eye_detector.Initialize(path_eye_det, &img_shape, &eye_det_shape, eye_box_len);
 
-    cout << "[INFO] Eye Detection Model initialized!" << endl;
+    cout << "[INFO] Face+Eye Detection Models initialized!" << endl;
     // 系统稳定等待
     cout << "sleep for 0.2 second!" << endl;
-    sleep(0.2);  // 等待系统稳定
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等待系统稳定
     
     // 启动推理线程
-    std::thread inference_thread(inference_thread_func, &eye_detector, dual_display_offset_y);
+    std::thread inference_thread(inference_thread_func,
+                                 &eye_detector,
+                                 &face_detector,
+                                 dual_display_offset_y,
+                                 img_width,
+                                 img_height);
     cout << "[INFO] Inference thread started!" << endl;
 
     // 创建键盘监听线程
@@ -320,6 +696,7 @@ int main() {
      * 5. 资源释放
      ******************************************************************************************/
     
+    face_detector.Release();
     eye_detector.Release();  // 释放检测器资源
     processor.Release();  // 释放图像处理器资源
     visualizer.Release();  // 释放可视化器资源

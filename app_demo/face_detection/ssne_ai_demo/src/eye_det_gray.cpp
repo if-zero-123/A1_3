@@ -15,6 +15,126 @@ float Sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
 }
 
+float BoxWidth(const std::array<float, 4>& box) {
+    return std::max(0.0f, box[2] - box[0]);
+}
+
+float BoxHeight(const std::array<float, 4>& box) {
+    return std::max(0.0f, box[3] - box[1]);
+}
+
+float BoxCenterX(const std::array<float, 4>& box) {
+    return 0.5f * (box[0] + box[2]);
+}
+
+float BoxCenterY(const std::array<float, 4>& box) {
+    return 0.5f * (box[1] + box[3]);
+}
+
+std::vector<int> FilterSmallBoxes(const std::vector<std::array<float, 4>>& boxes,
+                                  const std::vector<int>& indices,
+                                  float min_box_size) {
+    std::vector<int> filtered;
+    filtered.reserve(indices.size());
+    for (int idx : indices) {
+        if (BoxWidth(boxes[idx]) >= min_box_size && BoxHeight(boxes[idx]) >= min_box_size) {
+            filtered.push_back(idx);
+        }
+    }
+    if (!filtered.empty()) {
+        return filtered;
+    }
+    return indices;
+}
+
+std::vector<int> SelectBestEyePair(const std::vector<std::array<float, 4>>& boxes,
+                                   const std::vector<float>& scores,
+                                   const std::vector<int>& indices,
+                                   int pair_candidates,
+                                   float pair_y_thresh,
+                                   float pair_size_ratio_thresh) {
+    if (indices.empty()) {
+        return {};
+    }
+    if (indices.size() <= 2) {
+        std::vector<int> ordered = indices;
+        std::sort(ordered.begin(), ordered.end(), [&](int lhs, int rhs) {
+            return BoxCenterX(boxes[lhs]) < BoxCenterX(boxes[rhs]);
+        });
+        return ordered;
+    }
+
+    std::vector<int> candidates = indices;
+    std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+        return scores[lhs] > scores[rhs];
+    });
+
+    const int candidate_count = std::min(static_cast<int>(candidates.size()), pair_candidates);
+    candidates.resize(candidate_count);
+
+    float best_score = -1e9f;
+    int best_left = -1;
+    int best_right = -1;
+    for (int i = 0; i < candidate_count; ++i) {
+        for (int j = i + 1; j < candidate_count; ++j) {
+            int idx_a = candidates[i];
+            int idx_b = candidates[j];
+            int left_idx = BoxCenterX(boxes[idx_a]) <= BoxCenterX(boxes[idx_b]) ? idx_a : idx_b;
+            int right_idx = left_idx == idx_a ? idx_b : idx_a;
+
+            const float w_l = BoxWidth(boxes[left_idx]);
+            const float h_l = BoxHeight(boxes[left_idx]);
+            const float w_r = BoxWidth(boxes[right_idx]);
+            const float h_r = BoxHeight(boxes[right_idx]);
+
+            const float avg_w = 0.5f * (w_l + w_r);
+            const float avg_h = 0.5f * (h_l + h_r);
+            if (avg_w <= 0.0f || avg_h <= 0.0f) {
+                continue;
+            }
+
+            const float y_diff = std::fabs(BoxCenterY(boxes[left_idx]) - BoxCenterY(boxes[right_idx])) / avg_h;
+            if (y_diff > pair_y_thresh) {
+                continue;
+            }
+
+            const float eps = 1e-6f;
+            const float size_ratio_w = std::max(w_l, w_r) / std::max(eps, std::min(w_l, w_r));
+            const float size_ratio_h = std::max(h_l, h_r) / std::max(eps, std::min(h_l, h_r));
+            const float size_ratio = std::max(size_ratio_w, size_ratio_h);
+            if (size_ratio > pair_size_ratio_thresh) {
+                continue;
+            }
+
+            const float horizontal_gap = (BoxCenterX(boxes[right_idx]) - BoxCenterX(boxes[left_idx])) / avg_w;
+            if (horizontal_gap < 0.5f || horizontal_gap > 10.0f) {
+                continue;
+            }
+
+            const float pair_score = (scores[left_idx] + scores[right_idx]) - 0.25f * y_diff - 0.1f * size_ratio;
+            if (pair_score > best_score) {
+                best_score = pair_score;
+                best_left = left_idx;
+                best_right = right_idx;
+            }
+        }
+    }
+
+    if (best_left >= 0 && best_right >= 0) {
+        return {best_left, best_right};
+    }
+
+    // fallback: top2 by score, ordered by x center
+    std::vector<int> fallback = candidates;
+    if (fallback.size() > 2) {
+        fallback.resize(2);
+    }
+    std::sort(fallback.begin(), fallback.end(), [&](int lhs, int rhs) {
+        return BoxCenterX(boxes[lhs]) < BoxCenterX(boxes[rhs]);
+    });
+    return fallback;
+}
+
 float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
     const float x1 = std::max(a[0], b[0]);
     const float y1 = std::max(a[1], b[1]);
@@ -32,9 +152,20 @@ float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
 
 void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                             std::array<int, 2>* in_det_shape, int in_box_len) {
-    nms_threshold = 0.30f;
-    keep_top_k = 4;
-    top_k = 20;
+    nms_threshold = 0.25f;
+    keep_top_k = 2;
+    top_k = 12;
+    eye_pair_only = true;
+    min_box_size = 8.0f;
+    pair_candidates = 12;
+    pair_y_thresh = 1.5f;
+    pair_size_ratio_thresh = 2.5f;
+    printf("[INFO] Eye postprocess: pair_only=%d min_box=%.1f pair_candidates=%d pair_y_thresh=%.2f pair_size_ratio_thresh=%.2f\n",
+           eye_pair_only ? 1 : 0,
+           min_box_size,
+           pair_candidates,
+           pair_y_thresh,
+           pair_size_ratio_thresh);
     img_shape = *in_img_shape;
     det_shape = *in_det_shape;
     box_len = in_box_len;
@@ -130,9 +261,18 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
         if (!suppressed) {
             keep.push_back(idx);
         }
-        if (static_cast<int>(keep.size()) >= keep_top_k) {
-            break;
-        }
+    }
+
+    keep = FilterSmallBoxes(*boxes, keep, min_box_size);
+    if (eye_pair_only) {
+        keep = SelectBestEyePair(*boxes,
+                                 *scores,
+                                 keep,
+                                 pair_candidates,
+                                 pair_y_thresh,
+                                 pair_size_ratio_thresh);
+    } else if (static_cast<int>(keep.size()) > keep_top_k) {
+        keep.resize(keep_top_k);
     }
 
     result->Reserve(static_cast<int>(keep.size()));

@@ -11,6 +11,11 @@
 #include <iomanip>
 #include <cmath>
 
+namespace {
+// Use a dedicated upper layer to avoid interfering with other OSD content.
+constexpr int kEyeOverlayLayerId = 4;
+}
+
 
 /**
  * @brief OSD可视化器初始化函数
@@ -77,8 +82,8 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
         quad_rangle_vec.emplace_back(q);     // 添加到矩形框向量
     }
 
-    // 调用OSD设备绘制所有矩形框到显示层
-    osd_device.Draw(quad_rangle_vec);
+    // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
+    osd_device.Draw(quad_rangle_vec, kEyeOverlayLayerId);
 }
 
 /**
@@ -120,7 +125,8 @@ void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
         }
     }
 
-    osd_device.Draw(quad_rangle_vec);
+    // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
+    osd_device.Draw(quad_rangle_vec, kEyeOverlayLayerId);
 }
 
 /**
