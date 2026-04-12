@@ -180,9 +180,9 @@ float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
 
 void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                             std::array<int, 2>* in_det_shape, int in_box_len) {
-    nms_threshold = 0.25f;
-    keep_top_k = 2;
-    top_k = 12;
+    nms_threshold = 0.45f;
+    keep_top_k = 4;
+    top_k = 20;
     eye_pair_only = false;
     min_box_size = 2.0f;
     pair_candidates = 12;
@@ -301,9 +301,9 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
                              std::vector<float>* scores,
                              FaceDetectionResult* result,
                              float* conf_threshold) {
-    constexpr float kEyeBoxShrinkW = 0.62f;
-    constexpr float kEyeBoxShrinkH = 0.52f;
-    constexpr float kEyeBoxCenterYOffset = 0.08f;
+    constexpr float kEyeBoxShrinkW = 0.85f;
+    constexpr float kEyeBoxShrinkH = 0.85f;
+    constexpr float kEyeBoxCenterYOffset = 0.0f;
     result->Clear();
     if (boxes->empty()) {
         return;

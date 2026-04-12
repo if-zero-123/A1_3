@@ -35,93 +35,126 @@ std::atomic<int> g_eye_draw_mode(1);             // 0: circle, 1: box
 VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
 
 namespace {
-constexpr float kEyeInferConfThreshold = 0.05f;    // 推理阈值（进一步放宽，优先提升召回）
+// ============================================================================
+// 配置参数
+// ============================================================================
+constexpr float kEyeInferConfThreshold = 0.05f;    // NPU推理阈值（宽松，优先召回）
 constexpr float kEyeDisplayScoreThreshold = 0.10f; // 首次显示阈值
 constexpr float kEyeDisplayScoreThresholdTracked = 0.05f; // 已跟踪后保持阈值
 constexpr float kEyeMinBoxSize = 2.0f;             // 过滤极小框
-constexpr int kEyeHoldFrames = 1;                  // 缩短保持，降低拖影和延迟
-constexpr int kClearAfterMissFrames = 2;           // 更快清屏，避免残影滞留
-constexpr float kEyeDotFixedRadius = 12.0f;        // 固定眼点半径（像素）
+constexpr int   kEyeHoldFrames = 5;                // 丢检后预测保持帧数（利用Kalman预测填补）
+constexpr int   kClearAfterMissFrames = 8;          // 连续空帧后清屏
+constexpr float kEyeDotFixedRadius = 8.0f;         // 固定眼点半径（像素）
 constexpr float kFaceInferConfThreshold = 0.45f;   // 人脸检测阈值
-constexpr int kFaceInferInterval = 3;              // 分时推理：降低人脸检测频率提升帧率
-constexpr int kFaceRoiHoldFrames = 10;             // 人脸短时丢检保持
-constexpr float kKalmanQPos = 16.0f;               // 过程噪声（位置），增大以提升跟随性
-constexpr float kKalmanQVel = 4.0f;                // 过程噪声（速度）
-constexpr float kKalmanR = 4.0f;                   // 观测噪声，减小以降低迟滞
+constexpr int   kFaceInferInterval = 15;           // 人脸检测每15帧一次，大幅让出NPU给眼睛
+constexpr int   kFaceRoiHoldFrames = 30;           // 人脸ROI保持帧数（配合低频检测）
 
-struct AxisKalman {
+// Kalman 滤波参数
+constexpr float kKalmanQPos = 0.5f;     // 位置过程噪声基准
+constexpr float kKalmanQVel = 0.3f;     // 速度过程噪声基准
+constexpr float kKalmanRBase = 12.0f;   // 测量噪声基准（越大越平滑）
+constexpr float kKalmanRMin = 3.0f;     // 快速运动时最小测量噪声
+constexpr float kKalmanDeadband = 1.5f; // 静止速度阈值
+
+// IoU匹配参数
+constexpr float kIoUMatchThreshold = 0.05f; // IoU大于此才认为同一目标
+
+// ============================================================================
+// 轻量级一维 Kalman 滤波器（跟踪位置和速度）
+// 替代原 EMA：能预测运动方向、自适应平滑
+// ============================================================================
+struct KalmanLite1D {
     bool initialized = false;
-    float x = 0.0f;
-    float v = 0.0f;
-    float p00 = 1.0f;
-    float p01 = 0.0f;
-    float p10 = 0.0f;
-    float p11 = 1.0f;
+    float x = 0.0f;   // 位置估计
+    float v = 0.0f;   // 速度估计
+    // 误差协方差 (2x2 对称，存3元素)
+    float P00 = 100.0f;
+    float P01 = 0.0f;
+    float P11 = 100.0f;
 
     void Init(float z) {
         initialized = true;
         x = z;
         v = 0.0f;
-        p00 = 10.0f;
-        p01 = 0.0f;
-        p10 = 0.0f;
-        p11 = 10.0f;
+        P00 = 100.0f;
+        P01 = 0.0f;
+        P11 = 100.0f;
     }
 
     void Predict(float q_pos, float q_vel) {
-        if (!initialized) {
-            return;
-        }
-        x += v;
-        const float n00 = p00 + p01 + p10 + p11 + q_pos;
-        const float n01 = p01 + p11;
-        const float n10 = p10 + p11;
-        const float n11 = p11 + q_vel;
-        p00 = n00;
-        p01 = n01;
-        p10 = n10;
-        p11 = n11;
+        x = x + v;
+        float new_P00 = P00 + 2.0f * P01 + P11 + q_pos;
+        float new_P01 = P01 + P11;
+        float new_P11 = P11 + q_vel;
+        P00 = new_P00;
+        P01 = new_P01;
+        P11 = new_P11;
     }
 
-    void Update(float z, float r) {
+    void Update(float z, float R) {
         if (!initialized) {
             Init(z);
             return;
         }
-        const float y = z - x;
-        const float s = p00 + r;
-        const float k0 = p00 / s;
-        const float k1 = p10 / s;
-        x += k0 * y;
-        v += k1 * y;
-
-        const float o00 = p00;
-        const float o01 = p01;
-        const float o10 = p10;
-        const float o11 = p11;
-        p00 = (1.0f - k0) * o00;
-        p01 = (1.0f - k0) * o01;
-        p10 = o10 - k1 * o00;
-        p11 = o11 - k1 * o01;
+        float y = z - x;
+        float S = P00 + R;
+        if (S < 1e-6f) S = 1e-6f;
+        float K0 = P00 / S;
+        float K1 = P01 / S;
+        x = x + K0 * y;
+        v = v + K1 * y;
+        float new_P00 = (1.0f - K0) * P00;
+        float new_P01 = (1.0f - K0) * P01;
+        float new_P11 = P11 - K1 * P01;
+        P00 = new_P00;
+        P01 = new_P01;
+        P11 = new_P11;
     }
+
+    float Speed() const { return std::abs(v); }
 };
 
+// ============================================================================
+// 眼睛跟踪器（一只眼 = 4个 Kalman: cx, cy, w, h）
+// ============================================================================
 struct EyeTrack {
-    AxisKalman cx;
-    AxisKalman cy;
-    AxisKalman w;
-    AxisKalman h;
+    KalmanLite1D kcx;
+    KalmanLite1D kcy;
+    KalmanLite1D kw;
+    KalmanLite1D kh;
     int miss = 0;
+    int age = 0;
 
     bool IsReady() const {
-        return cx.initialized && cy.initialized && w.initialized && h.initialized;
+        return kcx.initialized && kcy.initialized && kw.initialized && kh.initialized;
+    }
+
+    void Reset() {
+        kcx = KalmanLite1D();
+        kcy = KalmanLite1D();
+        kw = KalmanLite1D();
+        kh = KalmanLite1D();
+        miss = 0;
+        age = 0;
+    }
+
+    float AdaptiveR() const {
+        float speed = std::max(kcx.Speed(), kcy.Speed());
+        if (speed < kKalmanDeadband) {
+            return kKalmanRBase * 2.0f;
+        }
+        float r = kKalmanRBase / (1.0f + speed * 0.15f);
+        return std::max(kKalmanRMin, r);
     }
 
     void Predict() {
-        cx.Predict(kKalmanQPos, kKalmanQVel);
-        cy.Predict(kKalmanQPos, kKalmanQVel);
-        w.Predict(kKalmanQPos, kKalmanQVel);
-        h.Predict(kKalmanQPos, kKalmanQVel);
+        if (!IsReady()) return;
+        float speed = std::max(kcx.Speed(), kcy.Speed());
+        float q_scale = 1.0f + speed * 0.1f;
+        kcx.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
+        kcy.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
+        kw.Predict(kKalmanQPos * 0.3f, kKalmanQVel * 0.1f);
+        kh.Predict(kKalmanQPos * 0.3f, kKalmanQVel * 0.1f);
     }
 
     void UpdateWithBox(const std::array<float, 4>& box) {
@@ -130,30 +163,60 @@ struct EyeTrack {
         const float bx = 0.5f * (box[0] + box[2]);
         const float by = 0.5f * (box[1] + box[3]);
 
+        float R = AdaptiveR();
         Predict();
-        cx.Update(bx, kKalmanR);
-        cy.Update(by, kKalmanR);
-        w.Update(bw, kKalmanR);
-        h.Update(bh, kKalmanR);
+        kcx.Update(bx, R);
+        kcy.Update(by, R);
+        kw.Update(bw, R * 1.5f);
+        kh.Update(bh, R * 1.5f);
         miss = 0;
+        age += 1;
     }
 
     std::array<float, 4> ToBox() const {
-        const float bw = std::max(1.0f, w.x);
-        const float bh = std::max(1.0f, h.x);
-        const float x1 = cx.x - 0.5f * bw;
-        const float y1 = cy.x - 0.5f * bh;
-        const float x2 = cx.x + 0.5f * bw;
-        const float y2 = cy.x + 0.5f * bh;
+        const float bw = std::max(1.0f, kw.x);
+        const float bh = std::max(1.0f, kh.x);
+        const float x1 = kcx.x - 0.5f * bw;
+        const float y1 = kcy.x - 0.5f * bh;
+        const float x2 = kcx.x + 0.5f * bw;
+        const float y2 = kcy.x + 0.5f * bh;
         return {x1, y1, x2, y2};
     }
 };
 
+// ============================================================================
+// 全局状态
+// ============================================================================
 EyeTrack g_eye_tracks[2];
 std::vector<std::array<float, 4>> g_last_drawn_boxes;
 int g_last_draw_frame = -10000;
 bool g_has_active_overlay = false;
 int g_consecutive_empty_frames = 0;
+
+// ============================================================================
+// 工具函数
+// ============================================================================
+
+float BoxArea(const std::array<float, 4>& b) {
+    return std::max(0.0f, b[2] - b[0]) * std::max(0.0f, b[3] - b[1]);
+}
+
+float ComputeIoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+    float ix1 = std::max(a[0], b[0]);
+    float iy1 = std::max(a[1], b[1]);
+    float ix2 = std::min(a[2], b[2]);
+    float iy2 = std::min(a[3], b[3]);
+    float inter = std::max(0.0f, ix2 - ix1) * std::max(0.0f, iy2 - iy1);
+    float uni = BoxArea(a) + BoxArea(b) - inter;
+    if (uni < 1e-6f) return 0.0f;
+    return inter / uni;
+}
+
+float CenterDist2(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+    float dx = (a[0] + a[2]) - (b[0] + b[2]);
+    float dy = (a[1] + a[3]) - (b[1] + b[3]);
+    return dx * dx + dy * dy;
+}
 
 bool SelectPrimaryFaceRoi(const FaceDetectionResult& face_result,
                           std::array<float, 4>* face_box_out) {
@@ -233,10 +296,14 @@ std::vector<std::array<float, 4>> SortByCenterX(
     return boxes;
 }
 
+// ============================================================================
+// 核心：IoU + 中心距离匹配 + Kalman 预测跟踪
+// ============================================================================
 std::vector<std::array<float, 4>> GetStableEyeBoxes(
     const FaceDetectionResult& result,
     float img_w,
     float img_h) {
+    // --- 第1步：筛选候选检测框 ---
     const bool has_track = g_eye_tracks[0].IsReady() || g_eye_tracks[1].IsReady();
     const float score_thresh = has_track ? kEyeDisplayScoreThresholdTracked : kEyeDisplayScoreThreshold;
     std::vector<std::pair<std::array<float, 4>, float>> candidates;
@@ -256,28 +323,69 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
                  const std::pair<std::array<float, 4>, float>& b) {
                   return a.second > b.second;
               });
-    if (candidates.size() > 2) {
-        candidates.resize(2);
+    if (candidates.size() > 4) {
+        candidates.resize(4);
     }
 
-    std::vector<std::array<float, 4>> current;
-    current.reserve(candidates.size());
+    std::vector<std::array<float, 4>> det_boxes;
+    det_boxes.reserve(candidates.size());
     for (const auto& item : candidates) {
-        current.push_back(item.first);
-    }
-    current = SortByCenterX(current);
-
-    for (int i = 0; i < 2; ++i) {
-        if (i < static_cast<int>(current.size())) {
-            g_eye_tracks[i].UpdateWithBox(current[i]);
-            continue;
-        }
-        if (g_eye_tracks[i].IsReady()) {
-            g_eye_tracks[i].Predict();
-            g_eye_tracks[i].miss += 1;
-        }
+        det_boxes.push_back(item.first);
     }
 
+    // --- 第2步：IoU + 中心距离匹配 ---
+    std::vector<bool> det_used(det_boxes.size(), false);
+
+    for (int t = 0; t < 2; ++t) {
+        if (!g_eye_tracks[t].IsReady()) continue;
+
+        std::array<float, 4> predicted = g_eye_tracks[t].ToBox();
+        int best_d = -1;
+        float best_score = -1.0f;
+
+        for (int d = 0; d < static_cast<int>(det_boxes.size()); ++d) {
+            if (det_used[d]) continue;
+            float iou = ComputeIoU(predicted, det_boxes[d]);
+            if (iou < kIoUMatchThreshold) {
+                float dist2 = CenterDist2(predicted, det_boxes[d]);
+                float diag2 = BoxArea(predicted) * 4.0f;
+                if (diag2 > 1.0f && dist2 < diag2 * 4.0f) {
+                    iou = 0.01f;
+                } else {
+                    continue;
+                }
+            }
+            if (iou > best_score) {
+                best_score = iou;
+                best_d = d;
+            }
+        }
+
+        if (best_d >= 0) {
+            g_eye_tracks[t].UpdateWithBox(det_boxes[best_d]);
+            det_used[best_d] = true;
+        } else {
+            g_eye_tracks[t].Predict();
+            g_eye_tracks[t].miss += 1;
+            if (g_eye_tracks[t].miss > kEyeHoldFrames) {
+                g_eye_tracks[t].Reset();
+            }
+        }
+    }
+
+    // --- 第3步：未匹配检测框分配给空跟踪器 ---
+    for (int d = 0; d < static_cast<int>(det_boxes.size()); ++d) {
+        if (det_used[d]) continue;
+        for (int t = 0; t < 2; ++t) {
+            if (!g_eye_tracks[t].IsReady()) {
+                g_eye_tracks[t].UpdateWithBox(det_boxes[d]);
+                det_used[d] = true;
+                break;
+            }
+        }
+    }
+
+    // --- 第4步：输出稳定框 ---
     std::vector<std::array<float, 4>> stable;
     stable.reserve(2);
     for (int i = 0; i < 2; ++i) {
@@ -300,7 +408,7 @@ bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) 
         const float dy = std::fabs((boxes[i][1] + boxes[i][3]) * 0.5f - (g_last_drawn_boxes[i][1] + g_last_drawn_boxes[i][3]) * 0.5f);
         const float dw = std::fabs((boxes[i][2] - boxes[i][0]) - (g_last_drawn_boxes[i][2] - g_last_drawn_boxes[i][0]));
         const float dh = std::fabs((boxes[i][3] - boxes[i][1]) - (g_last_drawn_boxes[i][3] - g_last_drawn_boxes[i][1]));
-        if (dx > 2.0f || dy > 2.0f || dw > 2.0f || dh > 2.0f) {
+        if (dx > 1.5f || dy > 1.5f || dw > 1.5f || dh > 1.5f) {
             return true;
         }
     }
@@ -416,7 +524,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             continue;
         }
         
-        // 分时推理：先脸后眼。人脸低频刷新，眼睛每帧运行。
+        // 分时推理：人脸低频检测，眼睛每帧运行
         if (face_detector != nullptr &&
             ((img_pair.frame_id % kFaceInferInterval) == 0 || !has_face_roi)) {
             face_detector->Predict(&img_pair.img1, face_result, kFaceInferConfThreshold);
@@ -433,8 +541,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             }
         }
 
-        // 执行眼睛检测（非阻塞主循环）
-        // 眼睛每帧检测，脸框低频刷新并由ROI保持，兼顾稳定与速度
+        // 执行眼睛检测（每帧）
         eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
         std::vector<std::array<float, 4>> stable_boxes =
             GetStableEyeBoxes(*det_result1,
@@ -442,7 +549,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                               static_cast<float>(img_height));
 
 
-        // 绘制集合：始终优先显示脸框，再叠加眼点（固定大小风格）
+        // 绘制集合：脸框 + 眼点
         std::vector<std::array<float, 4>> draw_boxes;
         if (has_face_roi) {
             draw_boxes.push_back(last_face_roi);
@@ -472,18 +579,8 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         }
 
         g_consecutive_empty_frames = 0;
-        if (g_visualizer != nullptr) {
-            if (!eye_dot_boxes.empty()) {
-                for (size_t i = 0; i < eye_dot_boxes.size(); i++) {
-                    printf("[Frame %d] Stable Eye: (%.2f, %.2f, %.2f, %.2f)\n",
-                           img_pair.frame_id,
-                           eye_dot_boxes[i][0],
-                           eye_dot_boxes[i][1],
-                           eye_dot_boxes[i][2],
-                           eye_dot_boxes[i][3]);
-                }
-            }
-            // 当前策略：脸框显示矩形，眼睛显示固定大圆点（强调跟随而非框尺寸）
+        if (g_visualizer != nullptr && ShouldRedraw(eye_dot_boxes, img_pair.frame_id)) {
+            // 只在眼睛位置发生明显变化时重绘OSD，避免每帧重写导致闪烁
             std::vector<std::array<float, 4>> face_draw;
             std::vector<std::array<float, 4>> eye_draw;
             if (has_face_roi) {
@@ -497,7 +594,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             } else {
                 g_visualizer->Draw(eye_draw);
             }
-            g_last_drawn_boxes = draw_boxes;
+            g_last_drawn_boxes = eye_dot_boxes;
             g_last_draw_frame = img_pair.frame_id;
             g_has_active_overlay = true;
         }
