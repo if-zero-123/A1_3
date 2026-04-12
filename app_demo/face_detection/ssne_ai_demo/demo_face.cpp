@@ -4,6 +4,12 @@
  * @Email: hongying.he@smartsenstech.com
  * @Date: 2025-12-30 14-57-47
  * @Copyright (c) 2025 SmartSens
+ *
+ * 优化版：针对 NPU INT8 量化噪声设计的 4 层抗抖管线
+ *   第1层: 时序中值预滤波（3帧滑窗取中位数，去除异常值）
+ *   第2层: Kalman 滤波（大R值，重度平滑NPU噪声）
+ *   第3层: 输出量化（snap-to-pixel，消除亚像素抖动）
+ *   第4层: OSD 限频重绘（限制重绘频率，消除闪烁）
  */
 #include <fstream>
 #include <iostream>
@@ -36,38 +42,106 @@ VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
 
 namespace {
 // ============================================================================
-// 配置参数
+// 配置参数（针对 NPU 量化噪声深度调优）
 // ============================================================================
-constexpr float kEyeInferConfThreshold = 0.05f;    // NPU推理阈值（宽松，优先召回）
-constexpr float kEyeDisplayScoreThreshold = 0.10f; // 首次显示阈值
-constexpr float kEyeDisplayScoreThresholdTracked = 0.05f; // 已跟踪后保持阈值
-constexpr float kEyeMinBoxSize = 2.0f;             // 过滤极小框
-constexpr int   kEyeHoldFrames = 5;                // 丢检后预测保持帧数（利用Kalman预测填补）
-constexpr int   kClearAfterMissFrames = 8;          // 连续空帧后清屏
-constexpr float kEyeDotFixedRadius = 8.0f;         // 固定眼点半径（像素）
-constexpr float kFaceInferConfThreshold = 0.45f;   // 人脸检测阈值
-constexpr int   kFaceInferInterval = 15;           // 人脸检测每15帧一次，大幅让出NPU给眼睛
-constexpr int   kFaceRoiHoldFrames = 30;           // 人脸ROI保持帧数（配合低频检测）
+constexpr float kEyeInferConfThreshold = 0.15f;    // 提高推理阈值，过滤低置信噪声检测
+constexpr float kEyeDisplayScoreThreshold = 0.25f; // 首次显示需更高置信度
+constexpr float kEyeDisplayScoreThresholdTracked = 0.10f; // 已跟踪后适当放宽
+constexpr float kEyeMinBoxSize = 4.0f;             // 过滤极小框（NPU噪声常产生小框幻影）
+constexpr int   kEyeHoldFrames = 8;                // 丢检后保持8帧（Kalman预测填补）
+constexpr int   kClearAfterMissFrames = 12;         // 连续空帧后清屏
+constexpr float kEyeDotFixedRadius = 8.0f;          // 固定眼点半径（像素）
+constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
+constexpr int   kFaceInferInterval = 20;            // 人脸每20帧检测一次
+constexpr int   kFaceRoiHoldFrames = 40;            // 人脸ROI保持更久
 
-// Kalman 滤波参数
-constexpr float kKalmanQPos = 0.5f;     // 位置过程噪声基准
-constexpr float kKalmanQVel = 0.3f;     // 速度过程噪声基准
-constexpr float kKalmanRBase = 12.0f;   // 测量噪声基准（越大越平滑）
-constexpr float kKalmanRMin = 3.0f;     // 快速运动时最小测量噪声
-constexpr float kKalmanDeadband = 1.5f; // 静止速度阈值
+// Kalman 滤波参数（针对 NPU 噪声大幅提高 R）
+constexpr float kKalmanQPos = 0.2f;      // 位置过程噪声（小=相信速度模型）
+constexpr float kKalmanQVel = 0.1f;      // 速度过程噪声（小=速度不会突变）
+constexpr float kKalmanRStatic = 200.0f; // 静止时测量噪声（极大=几乎不信NPU单帧输出）
+constexpr float kKalmanRMoving = 30.0f;  // 运动时测量噪声（适中=跟手但不抖）
+constexpr float kKalmanRMin = 15.0f;     // R的下限
+constexpr float kSpeedThreshLow = 1.0f;  // 低于此视为静止
+constexpr float kSpeedThreshHigh = 8.0f; // 高于此视为快速运动
 
 // IoU匹配参数
-constexpr float kIoUMatchThreshold = 0.05f; // IoU大于此才认为同一目标
+constexpr float kIoUMatchThreshold = 0.05f;
+
+// 输出量化参数
+constexpr float kOutputSnapGrid = 1.0f;    // 输出坐标四舍五入到此精度（像素）
+
+// OSD 限频参数
+constexpr int kMinRedrawInterval = 2;       // 最少间隔2帧才重绘OSD
+constexpr float kRedrawMinDelta = 2.0f;     // 移动小于2px不重绘
+
+// 时序预滤波参数
+constexpr int kMedianWindowSize = 3;        // 中值滤波窗口（3帧）
+
+// ============================================================================
+// 时序中值预滤波器
+// 对每只眼的 raw detection 做 3 帧中值滤波，去除 NPU 量化异常值
+// ============================================================================
+struct MedianPreFilter {
+    static constexpr int N = kMedianWindowSize;
+    float buf_cx[N] = {};
+    float buf_cy[N] = {};
+    float buf_w[N] = {};
+    float buf_h[N] = {};
+    int count = 0;
+    int idx = 0;
+
+    void Reset() {
+        count = 0;
+        idx = 0;
+    }
+
+    void Push(float cx, float cy, float w, float h) {
+        buf_cx[idx] = cx;
+        buf_cy[idx] = cy;
+        buf_w[idx] = w;
+        buf_h[idx] = h;
+        idx = (idx + 1) % N;
+        if (count < N) count++;
+    }
+
+    static float Median3(float a, float b, float c) {
+        if (a > b) std::swap(a, b);
+        if (b > c) std::swap(b, c);
+        if (a > b) std::swap(a, b);
+        return b;
+    }
+
+    bool Get(float* out_cx, float* out_cy, float* out_w, float* out_h) const {
+        if (count < 1) return false;
+        if (count == 1) {
+            *out_cx = buf_cx[0]; *out_cy = buf_cy[0];
+            *out_w = buf_w[0]; *out_h = buf_h[0];
+            return true;
+        }
+        if (count == 2) {
+            // 2帧取平均
+            *out_cx = 0.5f * (buf_cx[0] + buf_cx[1]);
+            *out_cy = 0.5f * (buf_cy[0] + buf_cy[1]);
+            *out_w = 0.5f * (buf_w[0] + buf_w[1]);
+            *out_h = 0.5f * (buf_h[0] + buf_h[1]);
+            return true;
+        }
+        // 3帧取中值
+        *out_cx = Median3(buf_cx[0], buf_cx[1], buf_cx[2]);
+        *out_cy = Median3(buf_cy[0], buf_cy[1], buf_cy[2]);
+        *out_w = Median3(buf_w[0], buf_w[1], buf_w[2]);
+        *out_h = Median3(buf_h[0], buf_h[1], buf_h[2]);
+        return true;
+    }
+};
 
 // ============================================================================
 // 轻量级一维 Kalman 滤波器（跟踪位置和速度）
-// 替代原 EMA：能预测运动方向、自适应平滑
 // ============================================================================
 struct KalmanLite1D {
     bool initialized = false;
     float x = 0.0f;   // 位置估计
     float v = 0.0f;   // 速度估计
-    // 误差协方差 (2x2 对称，存3元素)
     float P00 = 100.0f;
     float P01 = 0.0f;
     float P11 = 100.0f;
@@ -76,9 +150,9 @@ struct KalmanLite1D {
         initialized = true;
         x = z;
         v = 0.0f;
-        P00 = 100.0f;
+        P00 = 50.0f;   // 较小初始方差=更快稳定
         P01 = 0.0f;
-        P11 = 100.0f;
+        P11 = 50.0f;
     }
 
     void Predict(float q_pos, float q_vel) {
@@ -103,6 +177,8 @@ struct KalmanLite1D {
         float K1 = P01 / S;
         x = x + K0 * y;
         v = v + K1 * y;
+        // 速度衰减：防止Kalman预测过冲
+        v *= 0.92f;
         float new_P00 = (1.0f - K0) * P00;
         float new_P01 = (1.0f - K0) * P01;
         float new_P11 = P11 - K1 * P01;
@@ -115,18 +191,18 @@ struct KalmanLite1D {
 };
 
 // ============================================================================
-// 眼睛跟踪器（一只眼 = 4个 Kalman: cx, cy, w, h）
+// 眼睛跟踪器
 // ============================================================================
 struct EyeTrack {
-    KalmanLite1D kcx;
-    KalmanLite1D kcy;
-    KalmanLite1D kw;
-    KalmanLite1D kh;
+    KalmanLite1D kcx, kcy, kw, kh;
+    MedianPreFilter median;   // 第1层：中值预滤波
     int miss = 0;
     int age = 0;
+    float last_output_cx = 0.0f;  // 上一次输出的位置（用于输出量化）
+    float last_output_cy = 0.0f;
 
     bool IsReady() const {
-        return kcx.initialized && kcy.initialized && kw.initialized && kh.initialized;
+        return kcx.initialized && kcy.initialized;
     }
 
     void Reset() {
@@ -134,27 +210,35 @@ struct EyeTrack {
         kcy = KalmanLite1D();
         kw = KalmanLite1D();
         kh = KalmanLite1D();
+        median.Reset();
         miss = 0;
         age = 0;
+        last_output_cx = 0.0f;
+        last_output_cy = 0.0f;
     }
 
+    // 自适应 R：静止时 R 极大（几乎纯靠 Kalman 预测），运动时 R 降低（跟手）
     float AdaptiveR() const {
         float speed = std::max(kcx.Speed(), kcy.Speed());
-        if (speed < kKalmanDeadband) {
-            return kKalmanRBase * 2.0f;
+        if (speed < kSpeedThreshLow) {
+            return kKalmanRStatic;   // 静止：R=200
         }
-        float r = kKalmanRBase / (1.0f + speed * 0.15f);
-        return std::max(kKalmanRMin, r);
+        if (speed > kSpeedThreshHigh) {
+            return kKalmanRMin;      // 快速运动：R=15
+        }
+        // 线性插值
+        float t = (speed - kSpeedThreshLow) / (kSpeedThreshHigh - kSpeedThreshLow);
+        return kKalmanRStatic + t * (kKalmanRMoving - kKalmanRStatic);
     }
 
     void Predict() {
         if (!IsReady()) return;
         float speed = std::max(kcx.Speed(), kcy.Speed());
-        float q_scale = 1.0f + speed * 0.1f;
+        float q_scale = 1.0f + speed * 0.05f;
         kcx.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
         kcy.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
-        kw.Predict(kKalmanQPos * 0.3f, kKalmanQVel * 0.1f);
-        kh.Predict(kKalmanQPos * 0.3f, kKalmanQVel * 0.1f);
+        kw.Predict(kKalmanQPos * 0.1f, kKalmanQVel * 0.05f);  // 宽高极稳
+        kh.Predict(kKalmanQPos * 0.1f, kKalmanQVel * 0.05f);
     }
 
     void UpdateWithBox(const std::array<float, 4>& box) {
@@ -163,23 +247,37 @@ struct EyeTrack {
         const float bx = 0.5f * (box[0] + box[2]);
         const float by = 0.5f * (box[1] + box[3]);
 
+        // 第1层：中值预滤波
+        median.Push(bx, by, bw, bh);
+        float mx, my, mw, mh;
+        if (!median.Get(&mx, &my, &mw, &mh)) {
+            return;  // 不可能到这里
+        }
+
+        // 第2层：Kalman 更新（用中值滤波后的值）
         float R = AdaptiveR();
         Predict();
-        kcx.Update(bx, R);
-        kcy.Update(by, R);
-        kw.Update(bw, R * 1.5f);
-        kh.Update(bh, R * 1.5f);
+        kcx.Update(mx, R);
+        kcy.Update(my, R);
+        kw.Update(mw, R * 3.0f);   // 宽高用更大R=极稳
+        kh.Update(mh, R * 3.0f);
         miss = 0;
         age += 1;
     }
 
+    // 第3层：输出量化（snap-to-grid）
     std::array<float, 4> ToBox() const {
-        const float bw = std::max(1.0f, kw.x);
-        const float bh = std::max(1.0f, kh.x);
-        const float x1 = kcx.x - 0.5f * bw;
-        const float y1 = kcy.x - 0.5f * bh;
-        const float x2 = kcx.x + 0.5f * bw;
-        const float y2 = kcy.x + 0.5f * bh;
+        float bw = std::max(1.0f, kw.x);
+        float bh = std::max(1.0f, kh.x);
+        // 坐标四舍五入到整数像素
+        float cx = std::round(kcx.x / kOutputSnapGrid) * kOutputSnapGrid;
+        float cy = std::round(kcy.x / kOutputSnapGrid) * kOutputSnapGrid;
+        bw = std::round(bw / kOutputSnapGrid) * kOutputSnapGrid;
+        bh = std::round(bh / kOutputSnapGrid) * kOutputSnapGrid;
+        float x1 = cx - 0.5f * bw;
+        float y1 = cy - 0.5f * bh;
+        float x2 = cx + 0.5f * bw;
+        float y2 = cy + 0.5f * bh;
         return {x1, y1, x2, y2};
     }
 };
@@ -247,12 +345,10 @@ std::vector<std::array<float, 4>> FilterEyesByFaceRoi(
     const float fy2 = std::max(0.0f, std::min(face_box[3], img_h - 1.0f));
     const float fw = std::max(1.0f, fx2 - fx1);
     const float fh = std::max(1.0f, fy2 - fy1);
-
     const float roi_x1 = std::max(0.0f, fx1 - 0.08f * fw);
     const float roi_x2 = std::min(img_w - 1.0f, fx2 + 0.08f * fw);
     const float roi_y1 = std::max(0.0f, fy1 - 0.05f * fh);
     const float roi_y2 = std::min(img_h - 1.0f, fy1 + 0.62f * fh);
-
     std::vector<std::array<float, 4>> filtered;
     filtered.reserve(eye_boxes.size());
     for (const auto& box : eye_boxes) {
@@ -260,7 +356,6 @@ std::vector<std::array<float, 4>> FilterEyesByFaceRoi(
         const float bh = std::max(1.0f, box[3] - box[1]);
         const float cx = 0.5f * (box[0] + box[2]);
         const float cy = 0.5f * (box[1] + box[3]);
-
         const bool in_roi = (cx >= roi_x1 && cx <= roi_x2 && cy >= roi_y1 && cy <= roi_y2);
         const bool size_ok = (bw <= 0.80f * fw && bh <= 0.80f * fh);
         if (in_roi && size_ok) {
@@ -270,9 +365,7 @@ std::vector<std::array<float, 4>> FilterEyesByFaceRoi(
     return filtered;
 }
 
-std::array<float, 4> ClampBoxToImage(const std::array<float, 4>& box,
-                                     float img_w,
-                                     float img_h) {
+std::array<float, 4> ClampBoxToImage(const std::array<float, 4>& box, float img_w, float img_h) {
     std::array<float, 4> out = box;
     out[0] = std::max(0.0f, std::min(out[0], img_w - 1.0f));
     out[1] = std::max(0.0f, std::min(out[1], img_h - 1.0f));
@@ -287,8 +380,7 @@ float CenterX(const std::array<float, 4>& box) {
     return 0.5f * (box[0] + box[2]);
 }
 
-std::vector<std::array<float, 4>> SortByCenterX(
-    std::vector<std::array<float, 4>> boxes) {
+std::vector<std::array<float, 4>> SortByCenterX(std::vector<std::array<float, 4>> boxes) {
     std::sort(boxes.begin(), boxes.end(), [](const std::array<float, 4>& a,
                                              const std::array<float, 4>& b) {
         return CenterX(a) < CenterX(b);
@@ -297,13 +389,13 @@ std::vector<std::array<float, 4>> SortByCenterX(
 }
 
 // ============================================================================
-// 核心：IoU + 中心距离匹配 + Kalman 预测跟踪
+// 核心跟踪：中值预滤波 + IoU匹配 + Kalman + 输出量化
 // ============================================================================
 std::vector<std::array<float, 4>> GetStableEyeBoxes(
     const FaceDetectionResult& result,
     float img_w,
     float img_h) {
-    // --- 第1步：筛选候选检测框 ---
+    // --- 筛选候选检测框 ---
     const bool has_track = g_eye_tracks[0].IsReady() || g_eye_tracks[1].IsReady();
     const float score_thresh = has_track ? kEyeDisplayScoreThresholdTracked : kEyeDisplayScoreThreshold;
     std::vector<std::pair<std::array<float, 4>, float>> candidates;
@@ -317,7 +409,6 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
             candidates.push_back({box, score});
         }
     }
-
     std::sort(candidates.begin(), candidates.end(),
               [](const std::pair<std::array<float, 4>, float>& a,
                  const std::pair<std::array<float, 4>, float>& b) {
@@ -333,7 +424,7 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
         det_boxes.push_back(item.first);
     }
 
-    // --- 第2步：IoU + 中心距离匹配 ---
+    // --- IoU + 中心距离匹配 ---
     std::vector<bool> det_used(det_boxes.size(), false);
 
     for (int t = 0; t < 2; ++t) {
@@ -373,7 +464,7 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
         }
     }
 
-    // --- 第3步：未匹配检测框分配给空跟踪器 ---
+    // --- 未匹配检测框分配给空跟踪器 ---
     for (int d = 0; d < static_cast<int>(det_boxes.size()); ++d) {
         if (det_used[d]) continue;
         for (int t = 0; t < 2; ++t) {
@@ -385,7 +476,7 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
         }
     }
 
-    // --- 第4步：输出稳定框 ---
+    // --- 输出稳定框 ---
     std::vector<std::array<float, 4>> stable;
     stable.reserve(2);
     for (int i = 0; i < 2; ++i) {
@@ -396,7 +487,12 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
     return SortByCenterX(stable);
 }
 
+// 第4层：OSD 限频重绘
 bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) {
+    // 强制最小重绘间隔
+    if (frame_id - g_last_draw_frame < kMinRedrawInterval) {
+        return false;
+    }
     if (g_last_draw_frame < 0) {
         return true;
     }
@@ -406,20 +502,16 @@ bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) 
     for (size_t i = 0; i < boxes.size(); ++i) {
         const float dx = std::fabs(CenterX(boxes[i]) - CenterX(g_last_drawn_boxes[i]));
         const float dy = std::fabs((boxes[i][1] + boxes[i][3]) * 0.5f - (g_last_drawn_boxes[i][1] + g_last_drawn_boxes[i][3]) * 0.5f);
-        const float dw = std::fabs((boxes[i][2] - boxes[i][0]) - (g_last_drawn_boxes[i][2] - g_last_drawn_boxes[i][0]));
-        const float dh = std::fabs((boxes[i][3] - boxes[i][1]) - (g_last_drawn_boxes[i][3] - g_last_drawn_boxes[i][1]));
-        if (dx > 1.5f || dy > 1.5f || dw > 1.5f || dh > 1.5f) {
+        if (dx > kRedrawMinDelta || dy > kRedrawMinDelta) {
             return true;
         }
     }
     return false;
 }
 
-std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box,
-                                    float img_w,
-                                    float img_h) {
-    const float cx = 0.5f * (eye_box[0] + eye_box[2]);
-    const float cy = 0.5f * (eye_box[1] + eye_box[3]);
+std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box, float img_w, float img_h) {
+    const float cx = std::round(0.5f * (eye_box[0] + eye_box[2]));  // snap to pixel
+    const float cy = std::round(0.5f * (eye_box[1] + eye_box[3]));
     const float r = kEyeDotFixedRadius;
     std::array<float, 4> out = {cx - r, cy - r, cx + r, cy + r};
     out[0] = std::max(0.0f, std::min(out[0], img_w - 1.0f));
@@ -438,26 +530,17 @@ struct ImagePair {
     int frame_id;
 };
 
-std::queue<ImagePair> image_queue;               // 图像队列
-const int MAX_QUEUE_SIZE = 1;                    // 队列长度设为1，优先最新帧降低延迟
+std::queue<ImagePair> image_queue;
+const int MAX_QUEUE_SIZE = 1;
 
-// 全局退出标志（线程安全）
 bool g_exit_flag = false;
-// 保护退出标志的互斥锁
 std::mutex g_mtx;
 
-/**
- * @brief 键盘监听程序，用于结束demo
- */
 void keyboard_listener() {
     std::string input;
     std::cout << "键盘监听线程已启动，输入 'q' 退出程序..." << std::endl;
-
     while (true) {
-        // 读取键盘输入（会阻塞直到有输入）
         std::cin >> input;
-
-        // 加锁修改退出标志
         std::lock_guard<std::mutex> lock(g_mtx);
         if (input == "q" || input == "Q") {
             g_exit_flag = true;
@@ -469,10 +552,6 @@ void keyboard_listener() {
     }
 }
 
-/**
- * @brief 检查退出标志的辅助函数（线程安全）
- * @return 是否需要退出
- */
 bool check_exit_flag() {
     std::lock_guard<std::mutex> lock(g_mtx);
     return g_exit_flag;
@@ -480,7 +559,7 @@ bool check_exit_flag() {
 
 
 /**
- * @brief 推理线程函数：从队列中获取图像并执行眼睛检测
+ * @brief 推理线程函数
  */
 void inference_thread_func(EYEDETGRAY* eye_detector,
                            SCRFDGRAY* face_detector,
@@ -489,7 +568,6 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                            int img_height) {
     cout << "[Thread] Inference thread started!" << endl;
     
-    // 眼睛检测结果初始化
     FaceDetectionResult* det_result1 = new FaceDetectionResult;
     FaceDetectionResult* face_result = new FaceDetectionResult;
     std::array<float, 4> last_face_roi = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -500,19 +578,12 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         ImagePair img_pair;
         bool has_image = false;
         
-        // 从队列中获取图像
         {
             std::unique_lock<std::mutex> lock(mtx_image);
-            
-            // 等待图像就绪或停止信号
             cv_image_ready.wait(lock, [] {
                 return !image_queue.empty() || stop_inference;
             });
-            
-            if (stop_inference && image_queue.empty()) {
-                break;
-            }
-            
+            if (stop_inference && image_queue.empty()) break;
             if (!image_queue.empty()) {
                 img_pair = image_queue.front();
                 image_queue.pop();
@@ -520,11 +591,9 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             }
         }
         
-        if (!has_image) {
-            continue;
-        }
+        if (!has_image) continue;
         
-        // 分时推理：人脸低频检测，眼睛每帧运行
+        // 人脸低频检测
         if (face_detector != nullptr &&
             ((img_pair.frame_id % kFaceInferInterval) == 0 || !has_face_roi)) {
             face_detector->Predict(&img_pair.img1, face_result, kFaceInferConfThreshold);
@@ -541,19 +610,14 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             }
         }
 
-        // 执行眼睛检测（每帧）
+        // 眼睛检测（每帧）
         eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
         std::vector<std::array<float, 4>> stable_boxes =
             GetStableEyeBoxes(*det_result1,
                               static_cast<float>(img_width),
                               static_cast<float>(img_height));
 
-
-        // 绘制集合：脸框 + 眼点
-        std::vector<std::array<float, 4>> draw_boxes;
-        if (has_face_roi) {
-            draw_boxes.push_back(last_face_roi);
-        }
+        // 构造绘制列表
         std::vector<std::array<float, 4>> eye_dot_boxes;
         eye_dot_boxes.reserve(stable_boxes.size());
         for (const auto& b : stable_boxes) {
@@ -561,15 +625,15 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                                                    static_cast<float>(img_width),
                                                    static_cast<float>(img_height)));
         }
-        draw_boxes.insert(draw_boxes.end(), eye_dot_boxes.begin(), eye_dot_boxes.end());
 
-        // 处理检测结果 - 右侧图像
-        if (draw_boxes.empty()) {
+        // 无检测时处理
+        if (eye_dot_boxes.empty() && !has_face_roi) {
             g_consecutive_empty_frames += 1;
             if (g_visualizer != nullptr && g_has_active_overlay &&
                 g_consecutive_empty_frames >= kClearAfterMissFrames) {
-                std::vector<std::array<float, 4>> empty_boxes;
-                g_visualizer->Draw(empty_boxes);
+                std::vector<std::array<float, 4>> empty;
+                g_visualizer->Draw(empty);
+                g_visualizer->DrawCircles(empty);
                 g_has_active_overlay = false;
                 g_last_drawn_boxes.clear();
                 g_last_draw_frame = img_pair.frame_id;
@@ -579,101 +643,62 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         }
 
         g_consecutive_empty_frames = 0;
+
+        // 第4层：OSD 限频重绘
         if (g_visualizer != nullptr && ShouldRedraw(eye_dot_boxes, img_pair.frame_id)) {
-            // 只在眼睛位置发生明显变化时重绘OSD，避免每帧重写导致闪烁
             std::vector<std::array<float, 4>> face_draw;
-            std::vector<std::array<float, 4>> eye_draw;
             if (has_face_roi) {
                 face_draw.push_back(last_face_roi);
             }
-            eye_draw = eye_dot_boxes;
 
             g_visualizer->Draw(face_draw);
             if (g_eye_draw_mode == 0) {
-                g_visualizer->DrawCircles(eye_draw);
+                g_visualizer->DrawCircles(eye_dot_boxes);
             } else {
-                g_visualizer->Draw(eye_draw);
+                g_visualizer->Draw(eye_dot_boxes);
             }
             g_last_drawn_boxes = eye_dot_boxes;
             g_last_draw_frame = img_pair.frame_id;
             g_has_active_overlay = true;
         }
-        
-        // // 处理检测结果 - 左侧图像
-        // if (det_result2->boxes.size() > 0) {
-        //     for (size_t i = 0; i < det_result2->boxes.size(); i++) {
-        //         float x3_orig = det_result2->boxes[i][0];
-        //         float y3_orig = det_result2->boxes[i][1] + dual_display_offset_y;
-        //         float x4_orig = det_result2->boxes[i][2];
-        //         float y4_orig = det_result2->boxes[i][3] + dual_display_offset_y;
-                
-        //         printf("[Frame %d] Left Face detected: (%.2f, %.2f, %.2f, %.2f)\n", 
-        //                img_pair.frame_id, x3_orig, y3_orig, x4_orig, y4_orig);
-        //     }
-        // } else {
-        //     cout << "[Frame " << img_pair.frame_id << "] Left No face detected" << endl;
-        // }
     }
     
-    // 释放资源
     delete det_result1;
     delete face_result;
-    
     cout << "[Thread] Inference thread stopped!" << endl;
 }
 
 /**
- * @brief 眼睛检测演示程序主函数
- * @return 执行结果，0表示成功
+ * @brief 主函数
  */
 int main(int argc, char* argv[]) {
-    /******************************************************************************************
-     * 1. 参数配置
-     ******************************************************************************************/
+    uint8_t load_flag = 0;
+    int img_width = 640;
+    int img_height = 480;
     
-    uint8_t load_flag = 0;  // 0: 当前load偶帧; 1: 当前load奇帧（初始值为0）
-    // 图像尺寸配置（根据镜头参数修改）
-    int img_width = 640;    // 输入图像宽度
-    int img_height = 480;  // 输入图像高度
-    
-    // 模型配置参数
-    array<int, 2> eye_det_shape = {640, 480};   // 眼睛检测模型输入尺寸
+    array<int, 2> eye_det_shape = {640, 480};
     string path_eye_det = "/app_demo/app_assets/models/eye.m1model";
 
-    // 锁死 circle 模式，忽略环境变量和命令行参数。
     g_eye_draw_mode = 0;
     printf("[INFO] Eye draw mode: circle (forced)\n");
 
-    // 保留后续脸部检测接口，方便分时推理时直接启用
     array<int, 2> face_det_shape = {640, 480};
     string path_face_det = "/app_demo/app_assets/models/face_640x480.m1model";
     
-    /******************************************************************************************
-     * 2. 系统初始化
-     ******************************************************************************************/
-    
-    // SSNE初始化
     if (ssne_initial()) {
         fprintf(stderr, "SSNE initialization failed!\n");
     }
     
-    // 图像处理器初始化
-    array<int, 2> img_shape = {img_width, img_height};  // 原始图像尺寸
-    const int dual_display_offset_y = 480;  // 双目显示时第二路图像Y方向的偏移量（上下拼接显示）
-    // 原图: 640×480, 模型输入图：640×480
-    // 输入比例一致，无需额外裁剪偏移量
+    array<int, 2> img_shape = {img_width, img_height};
+    const int dual_display_offset_y = 480;
     
-    // OSD可视化器初始化（用于绘制检测框）
     VISUALIZER visualizer;
-    visualizer.Initialize(img_shape);  // 初始化可视化器（配置图像尺寸）
-    
-    // 设置全局可视化器指针供推理线程使用
+    visualizer.Initialize(img_shape);
     g_visualizer = &visualizer;
 
     IMAGEPROCESSOR processor;
-    processor.Initialize(&img_shape);  // 初始化图像处理器（配置原图尺寸）
+    processor.Initialize(&img_shape);
     
-    // 启用脸部+眼睛：分时推理（先脸后眼）
     SCRFDGRAY face_detector;
     int face_box_len = face_det_shape[0] * face_det_shape[1];
     face_detector.Initialize(path_face_det, &img_shape, &face_det_shape, false, face_box_len);
@@ -683,11 +708,9 @@ int main(int argc, char* argv[]) {
     eye_detector.Initialize(path_eye_det, &img_shape, &eye_det_shape, eye_box_len);
 
     cout << "[INFO] Face+Eye Detection Models initialized!" << endl;
-    // 系统稳定等待
     cout << "sleep for 0.2 second!" << endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等待系统稳定
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     
-    // 启动推理线程
     std::thread inference_thread(inference_thread_func,
                                  &eye_detector,
                                  &face_detector,
@@ -696,11 +719,10 @@ int main(int argc, char* argv[]) {
                                  img_height);
     cout << "[INFO] Inference thread started!" << endl;
 
-    // 创建键盘监听线程
     std::thread listener_thread(keyboard_listener);
     
-    uint16_t num_frames = 0;  // 帧计数器
-    ssne_tensor_t img_sensor[2];  // 图像tensor定义
+    uint16_t num_frames = 0;
+    ssne_tensor_t img_sensor[2];
     ssne_tensor_t output_sensor[2];
     output_sensor[0] = create_tensor(img_width, img_height * 2, SSNE_Y_8, SSNE_BUF_AI);
     output_sensor[1] = create_tensor(img_width, img_height * 2, SSNE_Y_8, SSNE_BUF_AI);
@@ -715,34 +737,19 @@ int main(int argc, char* argv[]) {
 		res = start_isp_debug_load();
 		num_frames++;
 	}
-    /******************************************************************************************
-     * 3. 主处理循环 - 只负责图像拷贝到ISP debug，不阻塞推理
-     ******************************************************************************************/
-    //循环5000帧后推出，循环次数可以修改，也可以改成while(true)
+
     while (!check_exit_flag()) {
-        
-        // 从sensor获取图像（裁剪图）
         processor.GetDualImage(&img_sensor[0], &img_sensor[1]);
-
         get_even_or_odd_flag(load_flag);
-
-        if (load_flag == 0)
-        {
+        if (load_flag == 0) {
             copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[0]);
-        }
-        else
-        {
+        } else {
             copy_double_tensor_buffer(img_sensor[0], img_sensor[1], output_sensor[1]);
         }
-
-        // 启动ISP debug load（主循环核心任务，不能被阻塞）
         res = start_isp_debug_load();
         
-        // 将图像放入队列供推理线程使用（非阻塞）
         {
             std::unique_lock<std::mutex> lock(mtx_image);
-            
-            // 始终保留最新帧，满队列时丢弃旧帧，降低显示延迟
             if (image_queue.size() >= MAX_QUEUE_SIZE) {
                 image_queue.pop();
             }
@@ -753,48 +760,31 @@ int main(int argc, char* argv[]) {
             image_queue.push(img_pair);
             cv_image_ready.notify_one();
         }
-
-        num_frames += 1;  // 帧计数器递增
+        num_frames += 1;
     }
     
-    /******************************************************************************************
-     * 4. 停止推理线程并等待其完成
-     ******************************************************************************************/
-    
     cout << "[INFO] Main loop finished, stopping inference thread..." << endl;
-
-    // 等待监听线程退出，释放资源
     if (listener_thread.joinable()) {
         listener_thread.join();
     }
-    
-    // 设置停止标志并通知推理线程
     {
         std::unique_lock<std::mutex> lock(mtx_image);
         stop_inference = true;
         cv_image_ready.notify_one();
     }
-    
-    // 等待推理线程退出
     if (inference_thread.joinable()) {
         inference_thread.join();
         cout << "[INFO] Inference thread joined successfully!" << endl;
     }
     
-    /******************************************************************************************
-     * 5. 资源释放
-     ******************************************************************************************/
-    
     face_detector.Release();
-    eye_detector.Release();  // 释放检测器资源
-    processor.Release();  // 释放图像处理器资源
-    visualizer.Release();  // 释放可视化器资源
+    eye_detector.Release();
+    processor.Release();
+    visualizer.Release();
     
     if (ssne_release()) {
         fprintf(stderr, "SSNE release failed!\n");
         return -1;
     }
-    
     return 0;
 }
- 

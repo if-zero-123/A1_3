@@ -1,6 +1,13 @@
 /*
  * @Filename: eye_det_gray.cpp
  * @Description: 灰度眼睛检测实现文件，输出为3个分类头+3个bbox头
+ *
+ * 优化版解算管线：
+ *   1. Sigmoid 数值安全（防溢出）
+ *   2. DFL 数值精度改进（double累加 + 有效区间集中）
+ *   3. Weighted Box Fusion (WBF) 替代硬NMS（多框平均提升精度）
+ *   4. 移除 ShrinkBox（直接输出原始检测框，不扭曲中心）
+ *   5. 置信度加权框融合（同一目标的多个检测框按分数加权平均位置）
  */
 
 #include <algorithm>
@@ -13,7 +20,11 @@
 namespace {
 constexpr bool kEyeVerboseTensorDebug = false;
 
+// 数值安全的 Sigmoid：防止 exp 溢出
 float Sigmoid(float x) {
+    // clamp 到 [-20, 20]，exp(20)≈4.8e8 不会溢出 float
+    if (x > 20.0f) return 1.0f;
+    if (x < -20.0f) return 0.0f;
     return 1.0f / (1.0f + std::exp(-x));
 }
 
@@ -31,32 +42,6 @@ float BoxCenterX(const std::array<float, 4>& box) {
 
 float BoxCenterY(const std::array<float, 4>& box) {
     return 0.5f * (box[1] + box[3]);
-}
-
-std::array<float, 4> ShrinkBoxAroundCenter(const std::array<float, 4>& box,
-                                           float ratio_w,
-                                           float ratio_h,
-                                           float offset_y_ratio,
-                                           float max_w,
-                                           float max_h) {
-    const float cx = 0.5f * (box[0] + box[2]);
-    const float cy = 0.5f * (box[1] + box[3]);
-    const float src_w = std::max(1.0f, box[2] - box[0]);
-    const float src_h = std::max(1.0f, box[3] - box[1]);
-    const float w = src_w * ratio_w;
-    const float h = src_h * ratio_h;
-    const float cy_shifted = cy - offset_y_ratio * src_h;
-    std::array<float, 4> out = {
-        cx - 0.5f * w,
-        cy_shifted - 0.5f * h,
-        cx + 0.5f * w,
-        cy_shifted + 0.5f * h,
-    };
-    out[0] = std::max(0.0f, std::min(out[0], max_w));
-    out[1] = std::max(0.0f, std::min(out[1], max_h));
-    out[2] = std::max(0.0f, std::min(out[2], max_w));
-    out[3] = std::max(0.0f, std::min(out[3], max_h));
-    return out;
 }
 
 std::vector<int> FilterSmallBoxes(const std::vector<std::array<float, 4>>& boxes,
@@ -176,24 +161,98 @@ float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
     const float uni = area_a + area_b - inter;
     return uni <= 0.0f ? 0.0f : inter / uni;
 }
+
+// ============================================================================
+// Weighted Box Fusion (WBF)
+// 替代硬 NMS：重叠框不是丢弃，而是加权平均，得到更精确的位置
+// ============================================================================
+struct WBFCluster {
+    float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    float total_score = 0;
+    int count = 0;
+
+    void Add(const std::array<float, 4>& box, float score) {
+        x1 += box[0] * score;
+        y1 += box[1] * score;
+        x2 += box[2] * score;
+        y2 += box[3] * score;
+        total_score += score;
+        count += 1;
+    }
+
+    std::array<float, 4> GetBox() const {
+        if (total_score < 1e-6f) return {0, 0, 0, 0};
+        float inv = 1.0f / total_score;
+        return {x1 * inv, y1 * inv, x2 * inv, y2 * inv};
+    }
+
+    float GetScore() const {
+        // 使用平均分数，同时对多重覆盖给予轻微加分
+        if (count <= 0) return 0;
+        float avg = total_score / static_cast<float>(count);
+        // 多个检测框覆盖同一目标 → 确信度更高
+        float multi_bonus = std::min(0.15f, 0.05f * static_cast<float>(count - 1));
+        return std::min(1.0f, avg + multi_bonus);
+    }
+};
+
+void WeightedBoxFusion(const std::vector<std::array<float, 4>>& boxes,
+                       const std::vector<float>& scores,
+                       float iou_thresh,
+                       std::vector<std::array<float, 4>>* out_boxes,
+                       std::vector<float>* out_scores) {
+    if (boxes.empty()) return;
+
+    // 按分数降序排列的索引
+    std::vector<int> order(boxes.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return scores[a] > scores[b];
+    });
+
+    std::vector<WBFCluster> clusters;
+    std::vector<bool> used(boxes.size(), false);
+
+    for (int i : order) {
+        if (used[i]) continue;
+
+        WBFCluster cluster;
+        cluster.Add(boxes[i], scores[i]);
+        used[i] = true;
+
+        // 找所有与当前框重叠超过阈值的框，合并到同一个 cluster
+        for (int j : order) {
+            if (used[j]) continue;
+            if (IoU(boxes[i], boxes[j]) > iou_thresh) {
+                cluster.Add(boxes[j], scores[j]);
+                used[j] = true;
+            }
+        }
+
+        clusters.push_back(cluster);
+    }
+
+    out_boxes->reserve(clusters.size());
+    out_scores->reserve(clusters.size());
+    for (const auto& c : clusters) {
+        out_boxes->push_back(c.GetBox());
+        out_scores->push_back(c.GetScore());
+    }
+}
 }
 
 void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                             std::array<int, 2>* in_det_shape, int in_box_len) {
-    nms_threshold = 0.45f;
+    nms_threshold = 0.35f;     // WBF 融合阈值
     keep_top_k = 4;
-    top_k = 20;
+    top_k = 30;                // 更多候选给 WBF
     eye_pair_only = false;
-    min_box_size = 2.0f;
+    min_box_size = 3.0f;       // 过滤噪声产生的微小框
     pair_candidates = 12;
     pair_y_thresh = 1.5f;
     pair_size_ratio_thresh = 2.5f;
-    printf("[INFO] Eye postprocess: pair_only=%d min_box=%.1f pair_candidates=%d pair_y_thresh=%.2f pair_size_ratio_thresh=%.2f\n",
-           eye_pair_only ? 1 : 0,
-           min_box_size,
-           pair_candidates,
-           pair_y_thresh,
-           pair_size_ratio_thresh);
+    printf("[INFO] Eye postprocess: WBF fusion, pair_only=%d min_box=%.1f top_k=%d\n",
+           eye_pair_only ? 1 : 0, min_box_size, top_k);
     img_shape = *in_img_shape;
     det_shape = *in_det_shape;
     box_len = in_box_len;
@@ -221,7 +280,12 @@ void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_
 }
 
 
+// ============================================================================
+// DFL 解码 - 精度优化版
+// 使用 double 累加防止浮点误差积累，对 NPU INT8 量化后的小数值尤其重要
+// ============================================================================
 static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
+    // 第1步：找最大值（数值稳定 softmax）
     float max_val = -1e9f;
     for (int i = 0; i < 16; ++i) {
         float val = tensor[(start_channel + i) * spatial + idx];
@@ -230,14 +294,19 @@ static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
         }
     }
 
-    float sum = 0.0f;
-    float res = 0.0f;
+    // 第2步：用 double 精度做 softmax 加权，减少量化误差积累
+    double sum = 0.0;
+    double res = 0.0;
     for (int i = 0; i < 16; ++i) {
-        float weight = std::exp(tensor[(start_channel + i) * spatial + idx] - max_val);
+        float raw = tensor[(start_channel + i) * spatial + idx] - max_val;
+        // clamp 防止 exp 下溢
+        if (raw < -15.0f) raw = -15.0f;
+        double weight = std::exp(static_cast<double>(raw));
         sum += weight;
-        res += weight * static_cast<float>(i);
+        res += weight * static_cast<double>(i);
     }
-    return res / sum;
+    if (sum < 1e-12) return 0.0f;
+    return static_cast<float>(res / sum);
 }
 
 void PrintClsHeadStats(const char* tag, const float* cls_head, int spatial) {
@@ -297,18 +366,19 @@ void EYEDETGRAY::DecodeBranch(const float* cls_head, const float* box_head,
     }
 }
 
+// ============================================================================
+// 后处理 - 用 WBF 替代硬 NMS，直接输出原始框不做 Shrink
+// ============================================================================
 void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
                              std::vector<float>* scores,
                              FaceDetectionResult* result,
                              float* conf_threshold) {
-    constexpr float kEyeBoxShrinkW = 0.85f;
-    constexpr float kEyeBoxShrinkH = 0.85f;
-    constexpr float kEyeBoxCenterYOffset = 0.0f;
     result->Clear();
     if (boxes->empty()) {
         return;
     }
 
+    // 先按分数排序，截断到 top_k
     std::vector<int> order(boxes->size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
@@ -318,51 +388,45 @@ void EYEDETGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
         order.resize(top_k);
     }
 
-    std::vector<int> keep;
-    keep.reserve(order.size());
+    // 准备 top_k 候选
+    std::vector<std::array<float, 4>> top_boxes;
+    std::vector<float> top_scores;
+    top_boxes.reserve(order.size());
+    top_scores.reserve(order.size());
     for (int idx : order) {
-        if (scores->at(idx) < *conf_threshold) {
-            continue;
-        }
-        bool suppressed = false;
-        for (int kept_idx : keep) {
-            if (IoU(boxes->at(idx), boxes->at(kept_idx)) > nms_threshold) {
-                suppressed = true;
-                break;
-            }
-        }
-        if (!suppressed) {
-            keep.push_back(idx);
-        }
+        if (scores->at(idx) < *conf_threshold) continue;
+        top_boxes.push_back(boxes->at(idx));
+        top_scores.push_back(scores->at(idx));
     }
 
-    keep = FilterSmallBoxes(*boxes, keep, min_box_size);
+    // WBF 融合：重叠框取加权平均，而不是丢弃
+    std::vector<std::array<float, 4>> fused_boxes;
+    std::vector<float> fused_scores;
+    WeightedBoxFusion(top_boxes, top_scores, nms_threshold, &fused_boxes, &fused_scores);
+
+    // 过滤小框
+    std::vector<int> fused_indices(fused_boxes.size());
+    std::iota(fused_indices.begin(), fused_indices.end(), 0);
+    fused_indices = FilterSmallBoxes(fused_boxes, fused_indices, min_box_size);
+
+    // 眼睛对选择或截断
     if (eye_pair_only) {
-        keep = SelectBestEyePair(*boxes,
-                                 *scores,
-                                 keep,
-                                 pair_candidates,
-                                 pair_y_thresh,
-                                 pair_size_ratio_thresh);
-    } else if (static_cast<int>(keep.size()) > keep_top_k) {
-        keep.resize(keep_top_k);
+        fused_indices = SelectBestEyePair(fused_boxes, fused_scores, fused_indices,
+                                          pair_candidates, pair_y_thresh, pair_size_ratio_thresh);
+    } else if (static_cast<int>(fused_indices.size()) > keep_top_k) {
+        fused_indices.resize(keep_top_k);
     }
 
-    result->Reserve(static_cast<int>(keep.size()));
-    for (int idx : keep) {
-        std::array<float, 4> box = boxes->at(idx);
+    // 输出：直接缩放到原图坐标，不做 Shrink（保持中心精度）
+    result->Reserve(static_cast<int>(fused_indices.size()));
+    for (int idx : fused_indices) {
+        std::array<float, 4> box = fused_boxes[idx];
         box[0] = std::max(0.0f, std::min(box[0] * w_scale, static_cast<float>(img_shape[0])));
         box[1] = std::max(0.0f, std::min(box[1] * h_scale, static_cast<float>(img_shape[1])));
         box[2] = std::max(0.0f, std::min(box[2] * w_scale, static_cast<float>(img_shape[0])));
         box[3] = std::max(0.0f, std::min(box[3] * h_scale, static_cast<float>(img_shape[1])));
-        box = ShrinkBoxAroundCenter(box,
-                                    kEyeBoxShrinkW,
-                                    kEyeBoxShrinkH,
-                                    kEyeBoxCenterYOffset,
-                                    static_cast<float>(img_shape[0]),
-                                    static_cast<float>(img_shape[1]));
         result->boxes.emplace_back(box);
-        result->scores.emplace_back(scores->at(idx));
+        result->scores.emplace_back(fused_scores[idx]);
     }
 }
 
@@ -411,32 +475,30 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
         uint32_t size = get_total_size(outputs[i]);
         if (kEyeVerboseTensorDebug) {
             printf("\n[DEBUG] Output tensor %d total_size: %u elements\n", i, size);
-        }
-        
-        uint8_t* raw_u8 = reinterpret_cast<uint8_t*>(get_data(outputs[i]));
-        int8_t* raw_s8 = reinterpret_cast<int8_t*>(get_data(outputs[i]));
-        float* raw_f32 = reinterpret_cast<float*>(get_data(outputs[i]));
 
-        if (kEyeVerboseTensorDebug) {
+            uint8_t* raw_u8 = reinterpret_cast<uint8_t*>(get_data(outputs[i]));
+            int8_t* raw_s8 = reinterpret_cast<int8_t*>(get_data(outputs[i]));
+            float* raw_f32 = reinterpret_cast<float*>(get_data(outputs[i]));
+
             printf("  -> First 8 bytes (HEX):  ");
-            for (int j = 0; j < 8 && j < size; ++j) {
+            for (int j = 0; j < 8 && j < static_cast<int>(size); ++j) {
                 printf("%02X ", raw_u8[j]);
             }
             printf("\n");
 
             printf("  -> First 8 values (INT8): ");
-            for (int j = 0; j < 8 && j < size; ++j) {
+            for (int j = 0; j < 8 && j < static_cast<int>(size); ++j) {
                 printf("%d ", raw_s8[j]);
             }
             printf("\n");
 
             printf("  -> First 2 values (F32):  ");
-            for (int j = 0; j < 2 && (j * 4) < size; ++j) {
+            for (int j = 0; j < 2 && (j * 4) < static_cast<int>(size); ++j) {
                 printf("%e ", raw_f32[j]);
             }
             printf("\n");
         }
-        
+
         if (size == exp_cls_s8) cls_s8 = reinterpret_cast<float*>(get_data(outputs[i]));
         else if (size == exp_cls_s16) cls_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
         else if (size == exp_cls_s32) cls_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
@@ -444,10 +506,10 @@ void EYEDETGRAY::Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, flo
         else if (size == exp_box_s16) box_s16 = reinterpret_cast<float*>(get_data(outputs[i]));
         else if (size == exp_box_s32) box_s32 = reinterpret_cast<float*>(get_data(outputs[i]));
     }
-    
+
     if (!cls_s8 || !cls_s16 || !cls_s32 || !box_s8 || !box_s16 || !box_s32) {
         printf("[ERROR] Output tensor size mismatch!\n");
-        printf("Expected total_size (elements): cls(%u, %u, %u), box(%u, %u, %u)\n", 
+        printf("Expected total_size (elements): cls(%u, %u, %u), box(%u, %u, %u)\n",
                exp_cls_s8, exp_cls_s16, exp_cls_s32, exp_box_s8, exp_box_s16, exp_box_s32);
         return;
     }
