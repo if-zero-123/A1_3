@@ -14,7 +14,9 @@
 namespace {
 // Use a dedicated upper layer to avoid interfering with other OSD content.
 constexpr int kEyeBoxLayerId = 4;
-constexpr int kEyeCircleLayerId = 5;
+// OSD layer index must be within [0, OSD_LAYER_SIZE-1].
+// Layer 5 may exceed valid range on this platform, causing add_quad_rangle_layer ret=-1.
+constexpr int kEyeCircleLayerId = 3;
 constexpr bool kOsdVerbose = false;
 }
 
@@ -103,34 +105,19 @@ void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
     }
 
     std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
-    constexpr float kRadiusScale = 0.42f;
-    constexpr int kNumPoints = 24;
-    constexpr float kPi = 3.14159265358979323846f;
 
+    // NOTE:
+    // OSD quadrangle engine has strict per-layer draw limits.
+    // Rendering a "circle" by many tiny quads easily causes ret=-1.
+    // Use one SOLID quad per eye as a stable large dot proxy.
     for (size_t i = 0; i < boxes.size(); i++) {
-        const float x1 = boxes[i][0];
-        const float y1 = boxes[i][1];
-        const float x2 = boxes[i][2];
-        const float y2 = boxes[i][3];
-        const float w = std::max(1.0f, x2 - x1);
-        const float h = std::max(1.0f, y2 - y1);
-        const float cx = (x1 + x2) * 0.5f;
-        const float cy = (y1 + y2) * 0.5f;
-        const float r = std::max(2.0f, kRadiusScale * std::min(w, h));
-
-        for (int p = 0; p < kNumPoints; ++p) {
-            const float theta = (2.0f * kPi * static_cast<float>(p)) / static_cast<float>(kNumPoints);
-            const float px = cx + r * std::cos(theta);
-            const float py = cy + r * std::sin(theta);
-
-            sst::device::osd::OsdQuadRangle q;
-            q.box = {px - 2.0f, py - 2.0f, px + 2.0f, py + 2.0f};
-            q.color = 1;
-            q.border = 1;
-            q.alpha = fdevice::TYPE_ALPHA75;
-            q.type = fdevice::TYPE_HOLLOW;
-            quad_rangle_vec.emplace_back(q);
-        }
+        sst::device::osd::OsdQuadRangle q;
+        q.box = boxes[i];
+        q.color = 1;
+        q.border = 0;
+        q.alpha = fdevice::TYPE_ALPHA75;
+        q.type = fdevice::TYPE_SOLID;
+        quad_rangle_vec.emplace_back(q);
     }
 
     // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
