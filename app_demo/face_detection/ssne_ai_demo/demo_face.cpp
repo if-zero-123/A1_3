@@ -78,18 +78,22 @@ constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 
 // 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
 
-// CPU 轻量精定位参数：在 NPU 眼框 ROI 内寻找暗区（瞳孔）中心
+// CPU 轻量精定位参数：在 NPU 眼框（包含整个眼睛/眉毛轮廓）内寻找最暗区（瞳孔）中心
 constexpr bool  kEnableCpuPupilRefine = true;
-constexpr float kPupilInnerMarginXRatio = 0.12f;
-constexpr float kPupilInnerTopMarginRatio = 0.18f;
-constexpr float kPupilInnerBottomMarginRatio = 0.10f;
-constexpr float kPupilDarkPercentile = 0.22f;
-constexpr int   kPupilThresholdBias = 6;
+// 因为 NPU 现在框的是大眼睛范围，边缘会包含眼影、眉毛、或者皮肤
+constexpr float kPupilInnerMarginXRatio = 0.15f;      // 左右切掉15%，去除眼角阴影
+constexpr float kPupilInnerTopMarginRatio = 0.25f;    // 顶部切掉25%，强行切掉哪怕是最浓的眉毛和绝大部分睫毛
+constexpr float kPupilInnerBottomMarginRatio = 0.15f; // 底部切掉15%，去除下眼睑阴影
+// 只有最纯粹的黑色才是瞳孔（防散焦把虹膜连带进来）
+constexpr float kPupilDarkPercentile = 0.05f;         // 只要最暗的5%（瞳孔核心区）
+constexpr int   kPupilThresholdBias = 6;              // 阈值自适应偏移
 constexpr float kPupilMinAreaRatio = 0.0025f;
 constexpr float kPupilMaxAreaRatio = 0.30f;
-constexpr float kPupilMaxShiftRatio = 0.20f;
-constexpr float kPupilMaxShiftPixels = 5.0f;
-constexpr float kPupilBlendRatio = 0.35f;
+// 允许瞳孔在整个眼眶范围内任意游走（不再被限制在中心）
+constexpr float kPupilMaxShiftRatio = 0.50f;          // 允许偏离中心 50%（斜视时瞳孔在框的边缘）
+constexpr float kPupilMaxShiftPixels = 15.0f;         // 绝对允许偏移量放宽
+// 核心：100% 相信 CPU 给出的无抖动精确坐标！！绝不动摇！！
+constexpr float kPupilBlendRatio = 1.0f;              
 constexpr int   kPupilMinRoiSide = 10;
 
 // ============================================================================
