@@ -246,7 +246,7 @@ void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_
     nms_threshold = 0.35f;     // WBF 融合阈值
     keep_top_k = 4;
     top_k = 30;                // 更多候选给 WBF
-    eye_pair_only = false;
+    eye_pair_only = true;
     min_box_size = 3.0f;       // 过滤噪声产生的微小框
     pair_candidates = 12;
     pair_y_thresh = 1.5f;

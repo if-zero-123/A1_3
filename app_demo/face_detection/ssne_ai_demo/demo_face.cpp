@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <fcntl.h>
 #include <regex>
@@ -46,13 +47,13 @@ namespace {
 // ============================================================================
 constexpr float kEyeInferConfThreshold = 0.10f;    // 推理阈值
 constexpr float kEyeDisplayScoreThreshold = 0.20f; // 首次显示阈值
-constexpr float kEyeDisplayScoreThresholdTracked = 0.08f; // 已跟踪后保持阈值
+constexpr float kEyeDisplayScoreThresholdTracked = 0.12f; // 已跟踪后保持阈值（提高以抑制漂移噪声）
 constexpr float kEyeMinBoxSize = 3.0f;             // 过滤极小框
-constexpr int   kEyeHoldFrames = 5;                // 丢检后Kalman预测保持
-constexpr int   kClearAfterMissFrames = 8;          // 连续空帧后清屏
+constexpr int   kEyeHoldFrames = 0;                // 丢检不保持，避免预测漂移
+constexpr int   kClearAfterMissFrames = 3;          // 连续空帧后清屏，避免残留漂移
 constexpr float kEyeDotFixedRadius = 8.0f;          // 固定眼点半径
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
-constexpr int   kFaceInferInterval = 5;             // 人脸每5帧检测（低延迟）
+constexpr int   kFaceInferInterval = 3;             // 人脸ROI刷新频率，降低ROI过期风险
 constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
 
 // Kalman 滤波参数（残差自适应：静止平滑、运动瞬时跟手）
@@ -63,7 +64,11 @@ constexpr float kKalmanRActive = 5.0f;   // 运动时R（低=直接跟手）
 constexpr float kResidualThresh = 6.0f;  // 残差>此值 → 检测到运动，瞬间切低R
 
 // IoU匹配参数
-constexpr float kIoUMatchThreshold = 0.05f;
+constexpr float kIoUMatchThreshold = 0.10f;
+constexpr float kTrackMaxCenterDistMinPx = 14.0f;
+constexpr float kTrackMaxCenterDistScale = 1.8f;
+constexpr float kTrackAreaRatioMin = 0.35f;
+constexpr float kTrackAreaRatioMax = 2.80f;
 
 // 输出量化参数
 constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
@@ -72,6 +77,20 @@ constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
 constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 
 // 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
+
+// CPU 轻量精定位参数：在 NPU 眼框 ROI 内寻找暗区（瞳孔）中心
+constexpr bool  kEnableCpuPupilRefine = true;
+constexpr float kPupilInnerMarginXRatio = 0.12f;
+constexpr float kPupilInnerTopMarginRatio = 0.18f;
+constexpr float kPupilInnerBottomMarginRatio = 0.10f;
+constexpr float kPupilDarkPercentile = 0.22f;
+constexpr int   kPupilThresholdBias = 6;
+constexpr float kPupilMinAreaRatio = 0.0025f;
+constexpr float kPupilMaxAreaRatio = 0.30f;
+constexpr float kPupilMaxShiftRatio = 0.20f;
+constexpr float kPupilMaxShiftPixels = 5.0f;
+constexpr float kPupilBlendRatio = 0.35f;
+constexpr int   kPupilMinRoiSide = 10;
 
 // ============================================================================
 // 残差自适应 Kalman 滤波器
@@ -222,8 +241,9 @@ float ComputeIoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
 }
 
 float CenterDist2(const std::array<float, 4>& a, const std::array<float, 4>& b) {
-    float dx = (a[0] + a[2]) - (b[0] + b[2]);
-    float dy = (a[1] + a[3]) - (b[1] + b[3]);
+    // use true center difference to avoid 4x amplified distance gate
+    float dx = 0.5f * ((a[0] + a[2]) - (b[0] + b[2]));
+    float dy = 0.5f * ((a[1] + a[3]) - (b[1] + b[3]));
     return dx * dx + dy * dy;
 }
 
@@ -287,6 +307,268 @@ std::array<float, 4> ClampBoxToImage(const std::array<float, 4>& box, float img_
     return out;
 }
 
+int ClampInt(int v, int lo, int hi) {
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+bool ComputeAdaptiveDarkThreshold(const uint8_t* y_plane,
+                                  int img_w,
+                                  int roi_x,
+                                  int roi_y,
+                                  int roi_w,
+                                  int roi_h,
+                                  int* threshold_out) {
+    if (y_plane == nullptr || threshold_out == nullptr || roi_w <= 0 || roi_h <= 0) {
+        return false;
+    }
+
+    std::array<int, 256> hist = {0};
+    for (int y = 0; y < roi_h; ++y) {
+        const uint8_t* row = y_plane + (roi_y + y) * img_w + roi_x;
+        for (int x = 0; x < roi_w; ++x) {
+            hist[row[x]] += 1;
+        }
+    }
+
+    const int roi_area = roi_w * roi_h;
+    const int dark_rank = std::max(1, static_cast<int>(roi_area * kPupilDarkPercentile));
+    int cumulative = 0;
+    int percentile_value = 0;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += hist[i];
+        if (cumulative >= dark_rank) {
+            percentile_value = i;
+            break;
+        }
+    }
+
+    *threshold_out = ClampInt(percentile_value + kPupilThresholdBias, 0, 255);
+    return true;
+}
+
+struct BlobCandidate {
+    float score = -1.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+};
+
+bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
+                                 int img_w,
+                                 int roi_x,
+                                 int roi_y,
+                                 int roi_w,
+                                 int roi_h,
+                                 int threshold,
+                                 float* cx_out,
+                                 float* cy_out) {
+    if (y_plane == nullptr || cx_out == nullptr || cy_out == nullptr) {
+        return false;
+    }
+    if (roi_w <= 0 || roi_h <= 0) {
+        return false;
+    }
+
+    const int roi_area = roi_w * roi_h;
+    const int min_area = std::max(4, static_cast<int>(roi_area * kPupilMinAreaRatio));
+    const int max_area = std::max(min_area + 1, static_cast<int>(roi_area * kPupilMaxAreaRatio));
+
+    std::vector<uint8_t> visited(static_cast<size_t>(roi_area), 0);
+    std::vector<int> queue;
+    queue.reserve(static_cast<size_t>(roi_area));
+
+    BlobCandidate best;
+    const float roi_cx = static_cast<float>(roi_x) + 0.5f * static_cast<float>(roi_w - 1);
+    const float roi_cy = static_cast<float>(roi_y) + 0.5f * static_cast<float>(roi_h - 1);
+
+    for (int ry = 0; ry < roi_h; ++ry) {
+        for (int rx = 0; rx < roi_w; ++rx) {
+            const int seed_idx = ry * roi_w + rx;
+            if (visited[seed_idx] != 0) {
+                continue;
+            }
+
+            const uint8_t seed_val = y_plane[(roi_y + ry) * img_w + (roi_x + rx)];
+            if (seed_val > threshold) {
+                visited[seed_idx] = 1;
+                continue;
+            }
+
+            queue.clear();
+            queue.push_back(seed_idx);
+            visited[seed_idx] = 1;
+
+            int area = 0;
+            float sum_x = 0.0f;
+            float sum_y = 0.0f;
+            float sum_intensity = 0.0f;
+            int min_rx = rx;
+            int min_ry = ry;
+            int max_rx = rx;
+            int max_ry = ry;
+            bool touches_border = false;
+
+            for (size_t q = 0; q < queue.size(); ++q) {
+                const int idx = queue[q];
+                const int cy = idx / roi_w;
+                const int cx = idx - cy * roi_w;
+                const int gx = roi_x + cx;
+                const int gy = roi_y + cy;
+                const uint8_t pix = y_plane[gy * img_w + gx];
+
+                area += 1;
+                sum_x += static_cast<float>(gx);
+                sum_y += static_cast<float>(gy);
+                sum_intensity += static_cast<float>(pix);
+
+                min_rx = std::min(min_rx, cx);
+                min_ry = std::min(min_ry, cy);
+                max_rx = std::max(max_rx, cx);
+                max_ry = std::max(max_ry, cy);
+                if (cx == 0 || cy == 0 || cx == roi_w - 1 || cy == roi_h - 1) {
+                    touches_border = true;
+                }
+
+                const int nx[4] = {cx - 1, cx + 1, cx, cx};
+                const int ny[4] = {cy, cy, cy - 1, cy + 1};
+                for (int k = 0; k < 4; ++k) {
+                    if (nx[k] < 0 || ny[k] < 0 || nx[k] >= roi_w || ny[k] >= roi_h) {
+                        continue;
+                    }
+                    const int nidx = ny[k] * roi_w + nx[k];
+                    if (visited[nidx] != 0) {
+                        continue;
+                    }
+                    const uint8_t npix = y_plane[(roi_y + ny[k]) * img_w + (roi_x + nx[k])];
+                    if (npix <= threshold) {
+                        visited[nidx] = 1;
+                        queue.push_back(nidx);
+                    } else {
+                        visited[nidx] = 1;
+                    }
+                }
+            }
+
+            if (area < min_area || area > max_area) {
+                continue;
+            }
+
+            const float blob_w = static_cast<float>(max_rx - min_rx + 1);
+            const float blob_h = static_cast<float>(max_ry - min_ry + 1);
+            const float aspect = blob_w / std::max(1.0f, blob_h);
+            if (aspect < 0.30f || aspect > 3.30f) {
+                continue;
+            }
+
+            const float cx = sum_x / static_cast<float>(area);
+            const float cy = sum_y / static_cast<float>(area);
+            const float mean_dark = sum_intensity / static_cast<float>(area);
+            const float dx = cx - roi_cx;
+            const float dy = cy - roi_cy;
+            const float dist2 = dx * dx + dy * dy;
+
+            float score = (255.0f - mean_dark) * static_cast<float>(area) /
+                          (1.0f + 0.03f * dist2);
+            if (touches_border) {
+                score *= 0.65f;
+            }
+
+            if (score > best.score) {
+                best.score = score;
+                best.cx = cx;
+                best.cy = cy;
+            }
+        }
+    }
+
+    if (best.score <= 0.0f) {
+        return false;
+    }
+
+    *cx_out = best.cx;
+    *cy_out = best.cy;
+    return true;
+}
+
+bool RefineEyeBoxByCpuPupil(const std::array<float, 4>& eye_box,
+                            const uint8_t* y_plane,
+                            int img_w,
+                            int img_h,
+                            std::array<float, 4>* refined_box) {
+    if (!kEnableCpuPupilRefine || y_plane == nullptr || refined_box == nullptr) {
+        return false;
+    }
+    if (img_w <= 1 || img_h <= 1) {
+        return false;
+    }
+
+    const float bw = std::max(1.0f, eye_box[2] - eye_box[0]);
+    const float bh = std::max(1.0f, eye_box[3] - eye_box[1]);
+    if (bw < static_cast<float>(kPupilMinRoiSide) || bh < static_cast<float>(kPupilMinRoiSide)) {
+        return false;
+    }
+
+    const int roi_x1 = ClampInt(static_cast<int>(std::floor(eye_box[0] + bw * kPupilInnerMarginXRatio)), 0, img_w - 1);
+    const int roi_x2 = ClampInt(static_cast<int>(std::ceil(eye_box[2] - bw * kPupilInnerMarginXRatio)), 0, img_w - 1);
+    const int roi_y1 = ClampInt(static_cast<int>(std::floor(eye_box[1] + bh * kPupilInnerTopMarginRatio)), 0, img_h - 1);
+    const int roi_y2 = ClampInt(static_cast<int>(std::ceil(eye_box[3] - bh * kPupilInnerBottomMarginRatio)), 0, img_h - 1);
+
+    if (roi_x2 <= roi_x1 || roi_y2 <= roi_y1) {
+        return false;
+    }
+
+    const int roi_w = roi_x2 - roi_x1 + 1;
+    const int roi_h = roi_y2 - roi_y1 + 1;
+    if (roi_w < kPupilMinRoiSide || roi_h < kPupilMinRoiSide) {
+        return false;
+    }
+
+    int threshold = 0;
+    if (!ComputeAdaptiveDarkThreshold(y_plane, img_w, roi_x1, roi_y1, roi_w, roi_h, &threshold)) {
+        return false;
+    }
+
+    float refined_cx = 0.0f;
+    float refined_cy = 0.0f;
+    if (!FindPupilCenterFromDarkBlob(y_plane,
+                                     img_w,
+                                     roi_x1,
+                                     roi_y1,
+                                     roi_w,
+                                     roi_h,
+                                     threshold,
+                                     &refined_cx,
+                                     &refined_cy)) {
+        return false;
+    }
+
+    const float orig_cx = 0.5f * (eye_box[0] + eye_box[2]);
+    const float orig_cy = 0.5f * (eye_box[1] + eye_box[3]);
+    const float dx = refined_cx - orig_cx;
+    const float dy = refined_cy - orig_cy;
+    const float max_shift = std::max(kPupilMaxShiftPixels, std::min(bw, bh) * kPupilMaxShiftRatio);
+    if ((dx * dx + dy * dy) > (max_shift * max_shift)) {
+        return false;
+    }
+
+    const float blended_cx = (1.0f - kPupilBlendRatio) * orig_cx + kPupilBlendRatio * refined_cx;
+    const float blended_cy = (1.0f - kPupilBlendRatio) * orig_cy + kPupilBlendRatio * refined_cy;
+
+    std::array<float, 4> out = {
+        blended_cx - 0.5f * bw,
+        blended_cy - 0.5f * bh,
+        blended_cx + 0.5f * bw,
+        blended_cy + 0.5f * bh
+    };
+    *refined_box = ClampBoxToImage(out, static_cast<float>(img_w), static_cast<float>(img_h));
+    return true;
+}
+
 float CenterX(const std::array<float, 4>& box) {
     return 0.5f * (box[0] + box[2]);
 }
@@ -304,8 +586,10 @@ std::vector<std::array<float, 4>> SortByCenterX(std::vector<std::array<float, 4>
 // ============================================================================
 std::vector<std::array<float, 4>> GetStableEyeBoxes(
     const FaceDetectionResult& result,
-    float img_w,
-    float img_h) {
+    const std::array<float, 4>* face_roi,
+    const uint8_t* y_plane,
+    int img_w,
+    int img_h) {
     // --- 筛选候选检测框 ---
     const bool has_track = g_eye_tracks[0].IsReady() || g_eye_tracks[1].IsReady();
     const float score_thresh = has_track ? kEyeDisplayScoreThresholdTracked : kEyeDisplayScoreThreshold;
@@ -332,7 +616,25 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
     std::vector<std::array<float, 4>> det_boxes;
     det_boxes.reserve(candidates.size());
     for (const auto& item : candidates) {
-        det_boxes.push_back(item.first);
+        std::array<float, 4> box = item.first;
+        if (face_roi != nullptr) {
+            const float cx = 0.5f * (box[0] + box[2]);
+            const float cy = 0.5f * (box[1] + box[3]);
+            const float fw = std::max(1.0f, (*face_roi)[2] - (*face_roi)[0]);
+            const float fh = std::max(1.0f, (*face_roi)[3] - (*face_roi)[1]);
+            const float roi_x1 = std::max(0.0f, (*face_roi)[0] - 0.05f * fw);
+            const float roi_x2 = std::min(static_cast<float>(img_w - 1), (*face_roi)[2] + 0.05f * fw);
+            const float roi_y1 = std::max(0.0f, (*face_roi)[1] - 0.05f * fh);
+            const float roi_y2 = std::min(static_cast<float>(img_h - 1), (*face_roi)[1] + 0.62f * fh);
+            if (!(cx >= roi_x1 && cx <= roi_x2 && cy >= roi_y1 && cy <= roi_y2)) {
+                continue;
+            }
+        }
+        std::array<float, 4> refined_box;
+        if (RefineEyeBoxByCpuPupil(box, y_plane, img_w, img_h, &refined_box)) {
+            box = refined_box;
+        }
+        det_boxes.push_back(box);
     }
 
     // --- IoU + 中心距离匹配 ---
@@ -342,17 +644,28 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
         if (!g_eye_tracks[t].IsReady()) continue;
 
         std::array<float, 4> predicted = g_eye_tracks[t].ToBox();
+        const float pbw = std::max(1.0f, predicted[2] - predicted[0]);
+        const float pbh = std::max(1.0f, predicted[3] - predicted[1]);
+        const float max_dist = std::max(kTrackMaxCenterDistMinPx,
+                                        0.5f * (pbw + pbh) * kTrackMaxCenterDistScale);
+        const float max_dist2 = max_dist * max_dist;
         int best_d = -1;
         float best_score = -1.0f;
 
         for (int d = 0; d < static_cast<int>(det_boxes.size()); ++d) {
             if (det_used[d]) continue;
             float iou = ComputeIoU(predicted, det_boxes[d]);
+            const float p_area = std::max(1.0f, BoxArea(predicted));
+            const float d_area = std::max(1.0f, BoxArea(det_boxes[d]));
+            const float area_ratio = d_area / p_area;
+            if (area_ratio < kTrackAreaRatioMin || area_ratio > kTrackAreaRatioMax) {
+                continue;
+            }
             if (iou < kIoUMatchThreshold) {
                 float dist2 = CenterDist2(predicted, det_boxes[d]);
-                float diag2 = BoxArea(predicted) * 4.0f;
-                if (diag2 > 1.0f && dist2 < diag2 * 4.0f) {
-                    iou = 0.01f;
+                if (dist2 <= max_dist2) {
+                    const float proximity = 1.0f - std::min(1.0f, dist2 / (max_dist2 + 1e-6f));
+                    iou = 0.02f + 0.20f * proximity;
                 } else {
                     continue;
                 }
@@ -391,8 +704,8 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
     std::vector<std::array<float, 4>> stable;
     stable.reserve(2);
     for (int i = 0; i < 2; ++i) {
-        if (g_eye_tracks[i].IsReady() && g_eye_tracks[i].miss <= kEyeHoldFrames) {
-            stable.push_back(ClampBoxToImage(g_eye_tracks[i].ToBox(), img_w, img_h));
+        if (g_eye_tracks[i].IsReady() && g_eye_tracks[i].miss == 0) {
+            stable.push_back(ClampBoxToImage(g_eye_tracks[i].ToBox(), static_cast<float>(img_w), static_cast<float>(img_h)));
         }
     }
     return SortByCenterX(stable);
@@ -493,6 +806,8 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         }
         
         if (!has_image) continue;
+
+        const uint8_t* y_plane = reinterpret_cast<const uint8_t*>(get_data(img_pair.img1));
         
         // 人脸低频检测
         if (face_detector != nullptr &&
@@ -515,8 +830,10 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
         std::vector<std::array<float, 4>> stable_boxes =
             GetStableEyeBoxes(*det_result1,
-                              static_cast<float>(img_width),
-                              static_cast<float>(img_height));
+                              has_face_roi ? &last_face_roi : nullptr,
+                              y_plane,
+                              img_width,
+                              img_height);
 
         // 构造绘制列表
         std::vector<std::array<float, 4>> eye_dot_boxes;
