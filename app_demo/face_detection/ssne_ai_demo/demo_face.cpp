@@ -42,101 +42,42 @@ VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
 
 namespace {
 // ============================================================================
-// 配置参数（针对 NPU 量化噪声深度调优）
+// 配置参数（平衡低延迟 + 抗NPU噪声）
 // ============================================================================
-constexpr float kEyeInferConfThreshold = 0.15f;    // 提高推理阈值，过滤低置信噪声检测
-constexpr float kEyeDisplayScoreThreshold = 0.25f; // 首次显示需更高置信度
-constexpr float kEyeDisplayScoreThresholdTracked = 0.10f; // 已跟踪后适当放宽
-constexpr float kEyeMinBoxSize = 4.0f;             // 过滤极小框（NPU噪声常产生小框幻影）
-constexpr int   kEyeHoldFrames = 8;                // 丢检后保持8帧（Kalman预测填补）
-constexpr int   kClearAfterMissFrames = 12;         // 连续空帧后清屏
-constexpr float kEyeDotFixedRadius = 8.0f;          // 固定眼点半径（像素）
+constexpr float kEyeInferConfThreshold = 0.10f;    // 推理阈值
+constexpr float kEyeDisplayScoreThreshold = 0.20f; // 首次显示阈值
+constexpr float kEyeDisplayScoreThresholdTracked = 0.08f; // 已跟踪后保持阈值
+constexpr float kEyeMinBoxSize = 3.0f;             // 过滤极小框
+constexpr int   kEyeHoldFrames = 5;                // 丢检后Kalman预测保持
+constexpr int   kClearAfterMissFrames = 8;          // 连续空帧后清屏
+constexpr float kEyeDotFixedRadius = 8.0f;          // 固定眼点半径
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
-constexpr int   kFaceInferInterval = 20;            // 人脸每20帧检测一次
-constexpr int   kFaceRoiHoldFrames = 40;            // 人脸ROI保持更久
+constexpr int   kFaceInferInterval = 5;             // 人脸每5帧检测（低延迟）
+constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
 
-// Kalman 滤波参数（针对 NPU 噪声大幅提高 R）
-constexpr float kKalmanQPos = 0.2f;      // 位置过程噪声（小=相信速度模型）
-constexpr float kKalmanQVel = 0.1f;      // 速度过程噪声（小=速度不会突变）
-constexpr float kKalmanRStatic = 200.0f; // 静止时测量噪声（极大=几乎不信NPU单帧输出）
-constexpr float kKalmanRMoving = 30.0f;  // 运动时测量噪声（适中=跟手但不抖）
-constexpr float kKalmanRMin = 15.0f;     // R的下限
-constexpr float kSpeedThreshLow = 1.0f;  // 低于此视为静止
-constexpr float kSpeedThreshHigh = 8.0f; // 高于此视为快速运动
+// Kalman 滤波参数（残差自适应：静止平滑、运动瞬时跟手）
+constexpr float kKalmanQPos = 1.5f;      // 位置过程噪声（大=允许位置快速变化）
+constexpr float kKalmanQVel = 0.8f;      // 速度过程噪声（大=允许加速）
+constexpr float kKalmanRCalm = 40.0f;    // 静止时R（适度平滑，不过度延迟）
+constexpr float kKalmanRActive = 5.0f;   // 运动时R（低=直接跟手）
+constexpr float kResidualThresh = 6.0f;  // 残差>此值 → 检测到运动，瞬间切低R
 
 // IoU匹配参数
 constexpr float kIoUMatchThreshold = 0.05f;
 
 // 输出量化参数
-constexpr float kOutputSnapGrid = 1.0f;    // 输出坐标四舍五入到此精度（像素）
+constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
 
-// OSD 限频参数
-constexpr int kMinRedrawInterval = 2;       // 最少间隔2帧才重绘OSD
-constexpr float kRedrawMinDelta = 2.0f;     // 移动小于2px不重绘
+// OSD 重绘参数（移除限频，仅保留位移门控）
+constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 
-// 时序预滤波参数
-constexpr int kMedianWindowSize = 3;        // 中值滤波窗口（3帧）
+// 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
 
 // ============================================================================
-// 时序中值预滤波器
-// 对每只眼的 raw detection 做 3 帧中值滤波，去除 NPU 量化异常值
-// ============================================================================
-struct MedianPreFilter {
-    static constexpr int N = kMedianWindowSize;
-    float buf_cx[N] = {};
-    float buf_cy[N] = {};
-    float buf_w[N] = {};
-    float buf_h[N] = {};
-    int count = 0;
-    int idx = 0;
-
-    void Reset() {
-        count = 0;
-        idx = 0;
-    }
-
-    void Push(float cx, float cy, float w, float h) {
-        buf_cx[idx] = cx;
-        buf_cy[idx] = cy;
-        buf_w[idx] = w;
-        buf_h[idx] = h;
-        idx = (idx + 1) % N;
-        if (count < N) count++;
-    }
-
-    static float Median3(float a, float b, float c) {
-        if (a > b) std::swap(a, b);
-        if (b > c) std::swap(b, c);
-        if (a > b) std::swap(a, b);
-        return b;
-    }
-
-    bool Get(float* out_cx, float* out_cy, float* out_w, float* out_h) const {
-        if (count < 1) return false;
-        if (count == 1) {
-            *out_cx = buf_cx[0]; *out_cy = buf_cy[0];
-            *out_w = buf_w[0]; *out_h = buf_h[0];
-            return true;
-        }
-        if (count == 2) {
-            // 2帧取平均
-            *out_cx = 0.5f * (buf_cx[0] + buf_cx[1]);
-            *out_cy = 0.5f * (buf_cy[0] + buf_cy[1]);
-            *out_w = 0.5f * (buf_w[0] + buf_w[1]);
-            *out_h = 0.5f * (buf_h[0] + buf_h[1]);
-            return true;
-        }
-        // 3帧取中值
-        *out_cx = Median3(buf_cx[0], buf_cx[1], buf_cx[2]);
-        *out_cy = Median3(buf_cy[0], buf_cy[1], buf_cy[2]);
-        *out_w = Median3(buf_w[0], buf_w[1], buf_w[2]);
-        *out_h = Median3(buf_h[0], buf_h[1], buf_h[2]);
-        return true;
-    }
-};
-
-// ============================================================================
-// 轻量级一维 Kalman 滤波器（跟踪位置和速度）
+// 残差自适应 Kalman 滤波器
+// 核心思路：用测量残差(预测值与测量值的差)判断是静止还是运动
+//   残差小 → 静止/NPU噪声 → R大 → 平滑
+//   残差大 → 真实运动      → R小 → 瞬间跟手
 // ============================================================================
 struct KalmanLite1D {
     bool initialized = false;
@@ -150,26 +91,36 @@ struct KalmanLite1D {
         initialized = true;
         x = z;
         v = 0.0f;
-        P00 = 50.0f;   // 较小初始方差=更快稳定
+        P00 = 20.0f;
         P01 = 0.0f;
-        P11 = 50.0f;
+        P11 = 20.0f;
     }
 
     void Predict(float q_pos, float q_vel) {
         x = x + v;
-        float new_P00 = P00 + 2.0f * P01 + P11 + q_pos;
-        float new_P01 = P01 + P11;
-        float new_P11 = P11 + q_vel;
-        P00 = new_P00;
-        P01 = new_P01;
-        P11 = new_P11;
+        P00 = P00 + 2.0f * P01 + P11 + q_pos;
+        P01 = P01 + P11;
+        P11 = P11 + q_vel;
     }
 
-    void Update(float z, float R) {
+    // 残差自适应更新：R 根据残差大小动态决定
+    void Update(float z) {
         if (!initialized) {
             Init(z);
             return;
         }
+        float residual = std::abs(z - x);
+        // 残差大 → 真正在动 → R小(跟手)
+        // 残差小 → NPU噪声 → R大(平滑)
+        float R;
+        if (residual > kResidualThresh) {
+            R = kKalmanRActive;   // 运动：R=5，立即跟上
+        } else {
+            // 在 calm 和 active 之间平滑过渡
+            float t = residual / kResidualThresh;
+            R = kKalmanRCalm * (1.0f - t * t) + kKalmanRActive * (t * t);
+        }
+
         float y = z - x;
         float S = P00 + R;
         if (S < 1e-6f) S = 1e-6f;
@@ -177,29 +128,21 @@ struct KalmanLite1D {
         float K1 = P01 / S;
         x = x + K0 * y;
         v = v + K1 * y;
-        // 速度衰减：防止Kalman预测过冲
-        v *= 0.92f;
-        float new_P00 = (1.0f - K0) * P00;
-        float new_P01 = (1.0f - K0) * P01;
-        float new_P11 = P11 - K1 * P01;
-        P00 = new_P00;
-        P01 = new_P01;
-        P11 = new_P11;
+        P00 = (1.0f - K0) * P00;
+        P01 = (1.0f - K0) * P01;
+        P11 = P11 - K1 * P01;
     }
 
     float Speed() const { return std::abs(v); }
 };
 
 // ============================================================================
-// 眼睛跟踪器
+// 眼睛跟踪器（精简版：无中值预滤波 → 零额外延迟）
 // ============================================================================
 struct EyeTrack {
     KalmanLite1D kcx, kcy, kw, kh;
-    MedianPreFilter median;   // 第1层：中值预滤波
     int miss = 0;
     int age = 0;
-    float last_output_cx = 0.0f;  // 上一次输出的位置（用于输出量化）
-    float last_output_cy = 0.0f;
 
     bool IsReady() const {
         return kcx.initialized && kcy.initialized;
@@ -210,35 +153,16 @@ struct EyeTrack {
         kcy = KalmanLite1D();
         kw = KalmanLite1D();
         kh = KalmanLite1D();
-        median.Reset();
         miss = 0;
         age = 0;
-        last_output_cx = 0.0f;
-        last_output_cy = 0.0f;
-    }
-
-    // 自适应 R：静止时 R 极大（几乎纯靠 Kalman 预测），运动时 R 降低（跟手）
-    float AdaptiveR() const {
-        float speed = std::max(kcx.Speed(), kcy.Speed());
-        if (speed < kSpeedThreshLow) {
-            return kKalmanRStatic;   // 静止：R=200
-        }
-        if (speed > kSpeedThreshHigh) {
-            return kKalmanRMin;      // 快速运动：R=15
-        }
-        // 线性插值
-        float t = (speed - kSpeedThreshLow) / (kSpeedThreshHigh - kSpeedThreshLow);
-        return kKalmanRStatic + t * (kKalmanRMoving - kKalmanRStatic);
     }
 
     void Predict() {
         if (!IsReady()) return;
-        float speed = std::max(kcx.Speed(), kcy.Speed());
-        float q_scale = 1.0f + speed * 0.05f;
-        kcx.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
-        kcy.Predict(kKalmanQPos * q_scale, kKalmanQVel * q_scale);
-        kw.Predict(kKalmanQPos * 0.1f, kKalmanQVel * 0.05f);  // 宽高极稳
-        kh.Predict(kKalmanQPos * 0.1f, kKalmanQVel * 0.05f);
+        kcx.Predict(kKalmanQPos, kKalmanQVel);
+        kcy.Predict(kKalmanQPos, kKalmanQVel);
+        kw.Predict(kKalmanQPos * 0.2f, kKalmanQVel * 0.1f);
+        kh.Predict(kKalmanQPos * 0.2f, kKalmanQVel * 0.1f);
     }
 
     void UpdateWithBox(const std::array<float, 4>& box) {
@@ -247,38 +171,25 @@ struct EyeTrack {
         const float bx = 0.5f * (box[0] + box[2]);
         const float by = 0.5f * (box[1] + box[3]);
 
-        // 第1层：中值预滤波
-        median.Push(bx, by, bw, bh);
-        float mx, my, mw, mh;
-        if (!median.Get(&mx, &my, &mw, &mh)) {
-            return;  // 不可能到这里
-        }
-
-        // 第2层：Kalman 更新（用中值滤波后的值）
-        float R = AdaptiveR();
+        // 直接 Predict + Update，零额外延迟
         Predict();
-        kcx.Update(mx, R);
-        kcy.Update(my, R);
-        kw.Update(mw, R * 3.0f);   // 宽高用更大R=极稳
-        kh.Update(mh, R * 3.0f);
+        kcx.Update(bx);
+        kcy.Update(by);
+        kw.Update(bw);
+        kh.Update(bh);
         miss = 0;
         age += 1;
     }
 
-    // 第3层：输出量化（snap-to-grid）
     std::array<float, 4> ToBox() const {
         float bw = std::max(1.0f, kw.x);
         float bh = std::max(1.0f, kh.x);
-        // 坐标四舍五入到整数像素
-        float cx = std::round(kcx.x / kOutputSnapGrid) * kOutputSnapGrid;
-        float cy = std::round(kcy.x / kOutputSnapGrid) * kOutputSnapGrid;
-        bw = std::round(bw / kOutputSnapGrid) * kOutputSnapGrid;
-        bh = std::round(bh / kOutputSnapGrid) * kOutputSnapGrid;
-        float x1 = cx - 0.5f * bw;
-        float y1 = cy - 0.5f * bh;
-        float x2 = cx + 0.5f * bw;
-        float y2 = cy + 0.5f * bh;
-        return {x1, y1, x2, y2};
+        float cx = std::round(kcx.x);
+        float cy = std::round(kcy.x);
+        bw = std::round(bw);
+        bh = std::round(bh);
+        return {cx - 0.5f * bw, cy - 0.5f * bh,
+                cx + 0.5f * bw, cy + 0.5f * bh};
     }
 };
 
@@ -487,24 +398,14 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
     return SortByCenterX(stable);
 }
 
-// 第4层：OSD 限频重绘
+// OSD 重绘判断（无限频，仅位移门控防闪烁）
 bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) {
-    // 强制最小重绘间隔
-    if (frame_id - g_last_draw_frame < kMinRedrawInterval) {
-        return false;
-    }
-    if (g_last_draw_frame < 0) {
-        return true;
-    }
-    if (boxes.size() != g_last_drawn_boxes.size()) {
-        return true;
-    }
+    if (g_last_draw_frame < 0) return true;
+    if (boxes.size() != g_last_drawn_boxes.size()) return true;
     for (size_t i = 0; i < boxes.size(); ++i) {
         const float dx = std::fabs(CenterX(boxes[i]) - CenterX(g_last_drawn_boxes[i]));
         const float dy = std::fabs((boxes[i][1] + boxes[i][3]) * 0.5f - (g_last_drawn_boxes[i][1] + g_last_drawn_boxes[i][3]) * 0.5f);
-        if (dx > kRedrawMinDelta || dy > kRedrawMinDelta) {
-            return true;
-        }
+        if (dx > kRedrawMinDelta || dy > kRedrawMinDelta) return true;
     }
     return false;
 }
