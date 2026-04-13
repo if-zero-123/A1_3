@@ -472,7 +472,15 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float blob_w = static_cast<float>(max_rx - min_rx + 1);
             const float blob_h = static_cast<float>(max_ry - min_ry + 1);
             const float aspect = blob_w / std::max(1.0f, blob_h);
-            if (aspect < 0.30f || aspect > 3.30f) {
+            
+            // 瞳孔（即使斜视）宽高比通常也不会太离谱。大于2.2的横长条极大概率是双眼皮褶皱或睫毛阴影
+            if (aspect < 0.40f || aspect > 2.20f) {
+                continue;
+            }
+
+            // 计算外接矩形的填充率（圆或椭圆的填充率在 0.7 左右，细长的不规则阴影通常很低）
+            const float fill_ratio = static_cast<float>(area) / (blob_w * blob_h);
+            if (fill_ratio < 0.45f) {
                 continue;
             }
 
@@ -483,10 +491,15 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float dy = cy - roi_cy;
             const float dist2 = dx * dx + dy * dy;
 
-            float score = (255.0f - mean_dark) * static_cast<float>(area) /
-                          (1.0f + 0.03f * dist2);
+            // 评分公式重构：瞳孔的核心特征是“极暗”和“致密团块”，而不是“面积越大越好”
+            // (255 - mean_dark) 权重提高；用 sqrt(area) 替代线性 area，防止巨大浅阴影干掉小而黑的瞳孔
+            // 降低空间距离惩罚(0.005 vs 0.03)，因为现在是全眼框，向左向右看时瞳孔本来就不在中心
+            float score = (255.0f - mean_dark) * std::sqrt(static_cast<float>(area)) * fill_ratio /
+                          (1.0f + 0.005f * dist2);
+                          
+            // 边缘触碰惩罚极大增加：触碰裁剪边界的通常是被切断的睫毛、阴影或眉毛
             if (touches_border) {
-                score *= 0.65f;
+                score *= 0.1f;
             }
 
             if (score > best.score) {
