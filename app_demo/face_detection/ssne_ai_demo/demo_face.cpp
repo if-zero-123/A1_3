@@ -84,14 +84,14 @@ constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 // CPU 轻量精定位参数：在 NPU 眼框（包含整个眼睛/眉毛轮廓）内寻找最暗区（瞳孔）中心
 constexpr bool  kEnableCpuPupilRefine = true;
 // 因为 NPU 现在框的是大眼睛范围，边缘会包含眼影、眉毛、或者皮肤
-constexpr float kPupilInnerMarginXRatio = 0.15f;      // 左右切掉15%，去除眼角阴影
-constexpr float kPupilInnerTopMarginRatio = 0.25f;    // 顶部切掉25%，强行切掉哪怕是最浓的眉毛和绝大部分睫毛
-constexpr float kPupilInnerBottomMarginRatio = 0.15f; // 底部切掉15%，去除下眼睑阴影
-// 只有最纯粹的黑色才是瞳孔（防散焦把虹膜连带进来）
-constexpr float kPupilDarkPercentile = 0.05f;         // 只要最暗的5%（瞳孔核心区）
+constexpr float kPupilInnerMarginXRatio = 0.10f;      // 适度切除
+constexpr float kPupilInnerTopMarginRatio = 0.20f;    // 适度切除顶部眉毛
+constexpr float kPupilInnerBottomMarginRatio = 0.10f; // 适度切除底部
+// 放宽提取域，防止光线暗时瞳孔破碎导致找不到
+constexpr float kPupilDarkPercentile = 0.15f;         
 constexpr int   kPupilThresholdBias = 6;              // 阈值自适应偏移
 constexpr float kPupilMinAreaRatio = 0.0025f;
-constexpr float kPupilMaxAreaRatio = 0.30f;
+constexpr float kPupilMaxAreaRatio = 0.50f;
 // 允许瞳孔在整个眼眶范围内任意游走（不再被限制在中心）
 constexpr float kPupilMaxShiftRatio = 0.50f;          // 允许偏离中心 50%（斜视时瞳孔在框的边缘）
 constexpr float kPupilMaxShiftPixels = 15.0f;         // 绝对允许偏移量放宽
@@ -473,14 +473,14 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float blob_h = static_cast<float>(max_ry - min_ry + 1);
             const float aspect = blob_w / std::max(1.0f, blob_h);
             
-            // 瞳孔（即使斜视）宽高比通常也不会太离谱。大于2.2的横长条极大概率是双眼皮褶皱或睫毛阴影
-            if (aspect < 0.40f || aspect > 2.20f) {
+            // 宽容的高宽比：哪怕眯眼、极度侧视，也不能丢！
+            if (aspect < 0.15f || aspect > 4.00f) {
                 continue;
             }
 
-            // 计算外接矩形的填充率（圆或椭圆的填充率在 0.7 左右，细长的不规则阴影通常很低）
+            // 宽容的填充率：防止反光点把瞳孔切成 c 形导致填充率过低被滤除
             const float fill_ratio = static_cast<float>(area) / (blob_w * blob_h);
-            if (fill_ratio < 0.45f) {
+            if (fill_ratio < 0.20f) {
                 continue;
             }
 
@@ -491,15 +491,13 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float dy = cy - roi_cy;
             const float dist2 = dx * dx + dy * dy;
 
-            // 评分公式重构：瞳孔的核心特征是“极暗”和“致密团块”，而不是“面积越大越好”
-            // (255 - mean_dark) 权重提高；用 sqrt(area) 替代线性 area，防止巨大浅阴影干掉小而黑的瞳孔
-            // 降低空间距离惩罚(0.005 vs 0.03)，因为现在是全眼框，向左向右看时瞳孔本来就不在中心
+            // 回归以“极暗度”为主，辅以面积，弱化距离惩罚（让瞳孔能走到视线边缘）
             float score = (255.0f - mean_dark) * std::sqrt(static_cast<float>(area)) * fill_ratio /
-                          (1.0f + 0.005f * dist2);
+                          (1.0f + 0.002f * dist2);
                           
-            // 边缘触碰惩罚极大增加：触碰裁剪边界的通常是被切断的睫毛、阴影或眉毛
+            // 触碰边界的稍微扣分（因为眼框裁取得很紧凑，真的瞳孔是有可能贴边的）
             if (touches_border) {
-                score *= 0.1f;
+                score *= 0.65f;
             }
 
             if (score > best.score) {
