@@ -171,6 +171,68 @@ class SCRFDGRAY {
                      FaceDetectionResult* result, float* conf_threshold);
 };
 
+/*! @brief 手部姿态检测结果的结构体定义。
+ */
+struct HandPoseResult {
+  std::vector<std::array<float, 4>> boxes;
+  std::vector<float> scores;
+  // 每个检测对应 kNumKeypoints 个关键点，每个关键点 = [x, y, visibility]
+  std::vector<std::vector<std::array<float, 3>>> keypoints;
+
+  HandPoseResult() {}
+  void Clear() {
+    boxes.clear();
+    scores.clear();
+    keypoints.clear();
+  }
+  void Reserve(int size) {
+    boxes.reserve(size);
+    scores.reserve(size);
+    keypoints.reserve(size);
+  }
+};
+
+class HANDPOSEGRAY {
+  public:
+    std::string ModelName() const { return "hand_pose_gray"; }
+
+    void Predict(ssne_tensor_t* img_in, HandPoseResult* result, float conf_threshold = 0.25f);
+
+    void Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
+                    std::array<int, 2>* in_det_shape, int in_box_len);
+
+    float nms_threshold;
+    int keep_top_k;
+    int top_k;
+    std::array<int, 2> img_shape;
+    std::array<int, 2> det_shape;
+    int box_len;
+    float w_scale;
+    float h_scale;
+    std::vector<int> steps;
+
+    static const int kNumKeypoints = 21;
+    static const int kKptChannels = 63;  // 21 * 3
+
+    void Release();
+
+  private:
+    uint16_t model_id = 0;
+    ssne_tensor_t inputs[1];
+    ssne_tensor_t outputs[9];  // 3 cls + 3 reg + 3 kpt
+    AiPreprocessPipe pipe_offline = GetAIPreprocessPipe();
+
+    void DecodeBranch(const float* cls_head, const float* box_head, const float* kpt_head,
+                      int feat_h, int feat_w, int stride, float conf_threshold,
+                      std::vector<std::array<float, 4>>* boxes,
+                      std::vector<float>* scores,
+                      std::vector<std::vector<std::array<float, 3>>>* keypoints) const;
+    void Postprocess(std::vector<std::array<float, 4>>* boxes,
+                     std::vector<float>* scores,
+                     std::vector<std::vector<std::array<float, 3>>>* keypoints,
+                     HandPoseResult* result, float* conf_threshold);
+};
+
 class EYEDETGRAY {
   public:
     std::string ModelName() const { return "eye_det_gray"; }
