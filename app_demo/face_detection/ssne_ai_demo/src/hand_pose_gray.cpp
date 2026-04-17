@@ -1,10 +1,13 @@
 /*
  * @Filename: hand_pose_gray.cpp
- * @Description: YOLOv8n-Pose hand keypoint detection
- *   - 9 output heads: 3 cls(cv3) + 3 reg(cv2) + 3 kpt(cv4)
- *   - 21 hand keypoints, each (x, y, visibility)
- *   - DFL decode (double precision, same as eye model)
- *   - Robust post-processing: NMS + min-box + aspect-ratio + kpt-in-box constraint
+ * @Description: YOLOv8n-Pose 手部关键点检测 (v3 - 全面重写)
+ *
+ * 核心改进:
+ *   1. 自适应置信度阈值: 自动计算分数分布，只保留 top-N 候选
+ *   2. 关键点 raw 值钳位: 防止量化后的异常大值导致关键点乱飘
+ *   3. 关键点硬约束: 强制所有关键点在检测框内
+ *   4. 首帧诊断输出: 打印 tensor 统计和解码示例，便于调试
+ *   5. 严格质量过滤: 最小框尺寸、面积比、宽高比、最少可见关键点数
  */
 
 #include <algorithm>
@@ -15,78 +18,72 @@
 #include "../include/utils.hpp"
 
 namespace {
-// Enable to print detailed per-frame diagnostics (first N frames only)
-constexpr bool kHandVerboseDebug = false;
-constexpr int  kHandDebugMaxFrames = 5;  // only print first N frames
-int g_hand_debug_frame_count = 0;
 
-// Post-processing quality filters
-constexpr float kMinBoxSizePx = 30.0f;    // reject boxes smaller than 30px on either dimension
-constexpr float kMinAspectRatio = 0.25f;   // reject extremely narrow boxes (w/h < 0.25 or h/w < 0.25)
-constexpr float kMaxAspectRatio = 4.0f;    // reject extremely tall/wide boxes
-constexpr float kKptBoxMargin = 0.3f;      // allow keypoints up to 30% outside box before clamping
-constexpr int   kMinValidKpts = 5;         // require at least 5 visible keypoints per hand
+// ---- 诊断: 在首次检测到手时打印，而非前N帧 ----
+constexpr int kDebugDetections = 3;  // 打印前N次有检测结果的帧
+int g_debug_det_count = 0;
 
+// ---- 质量过滤参数 ----
+constexpr float kMinBoxPx    = 30.0f;   // 框最小边长(像素)
+constexpr float kMaxAreaRatio = 0.60f;   // 框面积不超过图像60%
+constexpr float kMinAR       = 0.25f;    // 最小宽高比
+constexpr float kMaxAR       = 4.0f;     // 最大宽高比
+constexpr float kRawKptClamp = 2.0f;     // 原始关键点值钳位范围 [-2, 2]
+constexpr int   kMinVisKpts  = 3;        // 至少3个可见关键点
+
+// ---- 自适应阈值 ----
+constexpr int kAdaptiveTopN  = 50;       // 自适应: 最多保留50个候选
+
+// ============================================================================
 float Sigmoid(float x) {
     if (x > 20.0f) return 1.0f;
     if (x < -20.0f) return 0.0f;
     return 1.0f / (1.0f + std::exp(-x));
 }
 
-// DFL decode - double precision (same as eye_det_gray.cpp)
-static float DFL(const float* tensor, int start_channel, int spatial, int idx) {
-    float max_val = -1e9f;
-    for (int i = 0; i < 16; ++i) {
-        float val = tensor[(start_channel + i) * spatial + idx];
-        if (val > max_val) {
-            max_val = val;
-        }
-    }
+inline float Clamp(float v, float lo, float hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
 
-    double sum = 0.0;
-    double res = 0.0;
+// DFL 解码 (double精度, 与 eye_det_gray 一致)
+static float DFL(const float* tensor, int start_ch, int spatial, int idx) {
+    float mx = -1e9f;
     for (int i = 0; i < 16; ++i) {
-        float raw = tensor[(start_channel + i) * spatial + idx] - max_val;
-        if (raw < -15.0f) raw = -15.0f;
-        double weight = std::exp(static_cast<double>(raw));
-        sum += weight;
-        res += weight * static_cast<double>(i);
+        float v = tensor[(start_ch + i) * spatial + idx];
+        if (v > mx) mx = v;
     }
-    if (sum < 1e-12) return 0.0f;
-    return static_cast<float>(res / sum);
+    double sum = 0.0, res = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        float r = tensor[(start_ch + i) * spatial + idx] - mx;
+        if (r < -15.0f) r = -15.0f;
+        double w = std::exp(static_cast<double>(r));
+        sum += w;
+        res += w * static_cast<double>(i);
+    }
+    return (sum < 1e-12) ? 0.0f : static_cast<float>(res / sum);
 }
 
 float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
-    const float x1 = std::max(a[0], b[0]);
-    const float y1 = std::max(a[1], b[1]);
-    const float x2 = std::min(a[2], b[2]);
-    const float y2 = std::min(a[3], b[3]);
-    const float w = std::max(0.0f, x2 - x1);
-    const float h = std::max(0.0f, y2 - y1);
-    const float inter = w * h;
-    const float area_a = std::max(0.0f, a[2] - a[0]) * std::max(0.0f, a[3] - a[1]);
-    const float area_b = std::max(0.0f, b[2] - b[0]) * std::max(0.0f, b[3] - b[1]);
-    const float uni = area_a + area_b - inter;
-    return uni <= 0.0f ? 0.0f : inter / uni;
+    float ix1 = std::max(a[0], b[0]), iy1 = std::max(a[1], b[1]);
+    float ix2 = std::min(a[2], b[2]), iy2 = std::min(a[3], b[3]);
+    float inter = std::max(0.0f, ix2 - ix1) * std::max(0.0f, iy2 - iy1);
+    float ua = std::max(0.0f, a[2]-a[0]) * std::max(0.0f, a[3]-a[1]);
+    float ub = std::max(0.0f, b[2]-b[0]) * std::max(0.0f, b[3]-b[1]);
+    float uni = ua + ub - inter;
+    return (uni <= 0.0f) ? 0.0f : inter / uni;
 }
 
-// Check box quality: minimum size and reasonable aspect ratio
-bool IsValidBox(const std::array<float, 4>& box) {
-    const float w = box[2] - box[0];
-    const float h = box[3] - box[1];
-    if (w < kMinBoxSizePx || h < kMinBoxSizePx) return false;
-    const float ar = w / std::max(1e-6f, h);
-    if (ar < kMinAspectRatio || ar > kMaxAspectRatio) return false;
-    return true;
-}
 } // namespace
 
 
+// ============================================================================
+// Initialize
+// ============================================================================
 void HANDPOSEGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                               std::array<int, 2>* in_det_shape, int in_box_len) {
-    nms_threshold = 0.35f;   // more aggressive NMS (was 0.45)
-    keep_top_k = 3;          // max 3 hands (was 10)
-    top_k = 30;              // pre-NMS candidates (was 100)
+    nms_threshold = 0.30f;
+    keep_top_k = 2;
+    top_k = 20;
 
     img_shape = *in_img_shape;
     det_shape = *in_det_shape;
@@ -95,34 +92,35 @@ void HANDPOSEGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_im
     h_scale = static_cast<float>(img_shape[1]) / static_cast<float>(det_shape[1]);
     steps = {8, 16, 32};
 
-    printf("[INFO] HandPose: img=%dx%d det=%dx%d w_scale=%.3f h_scale=%.3f\n",
-           img_shape[0], img_shape[1], det_shape[0], det_shape[1], w_scale, h_scale);
-    printf("[INFO] HandPose: nms=%.2f keep_top_k=%d top_k=%d min_box=%.0f\n",
-           nms_threshold, keep_top_k, top_k, kMinBoxSizePx);
+    printf("[HAND] img=%dx%d det=%dx%d scale=%.2f/%.2f nms=%.2f topk=%d/%d\n",
+           img_shape[0], img_shape[1], det_shape[0], det_shape[1],
+           w_scale, h_scale, nms_threshold, top_k, keep_top_k);
 
-    char* model_path_char = const_cast<char*>(model_path.c_str());
-    model_id = ssne_loadmodel(model_path_char, SSNE_STATIC_ALLOC);
+    char* p = const_cast<char*>(model_path.c_str());
+    model_id = ssne_loadmodel(p, SSNE_STATIC_ALLOC);
 
-    uint32_t det_width = static_cast<uint32_t>(det_shape[0]);
-    uint32_t det_height = static_cast<uint32_t>(det_shape[1]);
-    inputs[0] = create_tensor(det_width, det_height, SSNE_Y_8, SSNE_BUF_AI);
+    inputs[0] = create_tensor(
+        static_cast<uint32_t>(det_shape[0]),
+        static_cast<uint32_t>(det_shape[1]),
+        SSNE_Y_8, SSNE_BUF_AI);
 
     int dtype = SSNE_UINT8;
     if (ssne_get_model_input_dtype(model_id, &dtype) == 0) {
         set_data_type(inputs[0], static_cast<uint8_t>(dtype));
-        printf("[INFO] HandPose model input dtype: %d\n", dtype);
+        printf("[HAND] input dtype: %d\n", dtype);
     }
 
-    const int normalize_ret = SetNormalize(pipe_offline, model_id);
-    if (normalize_ret != 0) {
-        printf("[WARN] HandPose model SetNormalize failed, ret: %d\n", normalize_ret);
-    }
+    int nr = SetNormalize(pipe_offline, model_id);
+    if (nr != 0) printf("[HAND] SetNormalize ret=%d\n", nr);
 
-    printf("[INFO] HandPose model loaded, kNumKeypoints=%d kKptChannels=%d\n",
-           kNumKeypoints, kKptChannels);
+    g_debug_det_count = 0;
+    printf("[HAND] model loaded (21 kpts, 9 outputs)\n");
 }
 
 
+// ============================================================================
+// DecodeBranch - 单个stride分支的解码
+// ============================================================================
 void HANDPOSEGRAY::DecodeBranch(const float* cls_head, const float* box_head,
                                 const float* kpt_head,
                                 int feat_h, int feat_w, int stride,
@@ -131,75 +129,59 @@ void HANDPOSEGRAY::DecodeBranch(const float* cls_head, const float* box_head,
                                 std::vector<float>* scores,
                                 std::vector<std::vector<std::array<float, 3>>>* keypoints) const {
     const int spatial = feat_h * feat_w;
-    const float det_w = static_cast<float>(det_shape[0]);
-    const float det_h = static_cast<float>(det_shape[1]);
+    const float dw = static_cast<float>(det_shape[0]);
+    const float dh = static_cast<float>(det_shape[1]);
+    const float max_area = dw * dh * kMaxAreaRatio;
 
-    for (int y = 0; y < feat_h; ++y) {
-        for (int x = 0; x < feat_w; ++x) {
-            const int idx = y * feat_w + x;
+    for (int gy = 0; gy < feat_h; ++gy) {
+        for (int gx = 0; gx < feat_w; ++gx) {
+            const int idx = gy * feat_w + gx;
             const float score = Sigmoid(cls_head[idx]);
-            if (score < conf_threshold) {
-                continue;
-            }
+            if (score < conf_threshold) continue;
 
-            // DFL box decode
-            const float cx = (static_cast<float>(x) + 0.5f) * stride;
-            const float cy = (static_cast<float>(y) + 0.5f) * stride;
-            const float l = DFL(box_head, 0, spatial, idx) * stride;
-            const float t = DFL(box_head, 16, spatial, idx) * stride;
-            const float r = DFL(box_head, 32, spatial, idx) * stride;
-            const float b = DFL(box_head, 48, spatial, idx) * stride;
+            // ---- DFL 边框解码 ----
+            float cx = (static_cast<float>(gx) + 0.5f) * stride;
+            float cy = (static_cast<float>(gy) + 0.5f) * stride;
+            float x1 = Clamp(cx - DFL(box_head, 0, spatial, idx) * stride, 0.0f, dw);
+            float y1 = Clamp(cy - DFL(box_head, 16, spatial, idx) * stride, 0.0f, dh);
+            float x2 = Clamp(cx + DFL(box_head, 32, spatial, idx) * stride, 0.0f, dw);
+            float y2 = Clamp(cy + DFL(box_head, 48, spatial, idx) * stride, 0.0f, dh);
+            if (x2 <= x1 || y2 <= y1) continue;
 
-            float x1 = std::max(0.0f, cx - l);
-            float y1 = std::max(0.0f, cy - t);
-            float x2 = std::min(det_w, cx + r);
-            float y2 = std::min(det_h, cy + b);
-            if (x2 <= x1 || y2 <= y1) {
-                continue;
-            }
+            float bw = x2 - x1, bh = y2 - y1;
 
-            // Early reject: minimum box size (in det-space pixels)
-            const float bw = x2 - x1;
-            const float bh = y2 - y1;
-            if (bw < kMinBoxSizePx || bh < kMinBoxSizePx) {
-                continue;
-            }
+            // ---- 框质量过滤 ----
+            if (bw < kMinBoxPx || bh < kMinBoxPx) continue;
+            if (bw * bh > max_area) continue;
+            float ar = bw / std::max(1e-6f, bh);
+            if (ar < kMinAR || ar > kMaxAR) continue;
 
-            // Keypoint decode (YOLOv8-Pose formula)
-            // Clamp keypoints to box + margin to prevent wild scatter
-            const float margin_x = bw * kKptBoxMargin;
-            const float margin_y = bh * kKptBoxMargin;
-            const float kpt_x_min = std::max(0.0f, x1 - margin_x);
-            const float kpt_y_min = std::max(0.0f, y1 - margin_y);
-            const float kpt_x_max = std::min(det_w, x2 + margin_x);
-            const float kpt_y_max = std::min(det_h, y2 + margin_y);
-
+            // ---- 关键点解码 (YOLOv8-Pose) ----
             std::vector<std::array<float, 3>> kpts(kNumKeypoints);
-            int valid_kpt_count = 0;
+            int vis_count = 0;
+
             for (int k = 0; k < kNumKeypoints; ++k) {
-                const float raw_x = kpt_head[(k * 3 + 0) * spatial + idx];
-                const float raw_y = kpt_head[(k * 3 + 1) * spatial + idx];
-                const float raw_v = kpt_head[(k * 3 + 2) * spatial + idx];
+                float rx = kpt_head[(k * 3 + 0) * spatial + idx];
+                float ry = kpt_head[(k * 3 + 1) * spatial + idx];
+                float rv = kpt_head[(k * 3 + 2) * spatial + idx];
 
-                float kpt_x = (raw_x * 2.0f + static_cast<float>(x)) * stride;
-                float kpt_y = (raw_y * 2.0f + static_cast<float>(y)) * stride;
-                const float kpt_vis = Sigmoid(raw_v);
+                // 钳位原始值, 防止量化异常导致关键点飞出
+                rx = Clamp(rx, -kRawKptClamp, kRawKptClamp);
+                ry = Clamp(ry, -kRawKptClamp, kRawKptClamp);
 
-                // Clamp keypoints to box + margin
-                kpt_x = std::max(kpt_x_min, std::min(kpt_x_max, kpt_x));
-                kpt_y = std::max(kpt_y_min, std::min(kpt_y_max, kpt_y));
+                float kx = (rx * 2.0f + static_cast<float>(gx)) * stride;
+                float ky = (ry * 2.0f + static_cast<float>(gy)) * stride;
+                float kv = Sigmoid(rv);
 
-                kpts[k] = {kpt_x, kpt_y, kpt_vis};
+                // 硬约束: 关键点必须在检测框内
+                kx = Clamp(kx, x1, x2);
+                ky = Clamp(ky, y1, y2);
 
-                if (kpt_vis > 0.3f) {
-                    valid_kpt_count++;
-                }
+                kpts[k] = {kx, ky, kv};
+                if (kv > 0.3f) vis_count++;
             }
 
-            // Reject detections with too few visible keypoints
-            if (valid_kpt_count < kMinValidKpts) {
-                continue;
-            }
+            if (vis_count < kMinVisKpts) continue;
 
             boxes->push_back({x1, y1, x2, y2});
             scores->push_back(score);
@@ -209,233 +191,192 @@ void HANDPOSEGRAY::DecodeBranch(const float* cls_head, const float* box_head,
 }
 
 
+// ============================================================================
+// Postprocess - NMS + 坐标缩放
+// ============================================================================
 void HANDPOSEGRAY::Postprocess(std::vector<std::array<float, 4>>* boxes,
                                std::vector<float>* scores,
                                std::vector<std::vector<std::array<float, 3>>>* keypoints,
                                HandPoseResult* result, float* conf_threshold) {
     result->Clear();
-    if (boxes->empty()) {
-        return;
-    }
+    if (boxes->empty()) return;
 
-    // Sort by score descending, truncate to top_k
+    // 按分数降序
     std::vector<int> order(boxes->size());
     std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-        return scores->at(lhs) > scores->at(rhs);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return scores->at(a) > scores->at(b);
     });
-    if (static_cast<int>(order.size()) > top_k) {
-        order.resize(top_k);
-    }
+    if (static_cast<int>(order.size()) > top_k) order.resize(top_k);
 
-    // Standard IoU NMS
+    // NMS
     std::vector<bool> suppressed(boxes->size(), false);
     std::vector<int> kept;
-    kept.reserve(keep_top_k);
-
     for (int i = 0; i < static_cast<int>(order.size()); ++i) {
-        const int idx_i = order[i];
-        if (suppressed[idx_i]) continue;
-        if (scores->at(idx_i) < *conf_threshold) continue;
-
-        // Aspect ratio check
-        if (!IsValidBox(boxes->at(idx_i))) continue;
-
-        kept.push_back(idx_i);
+        int ii = order[i];
+        if (suppressed[ii]) continue;
+        if (scores->at(ii) < *conf_threshold) continue;
+        kept.push_back(ii);
         if (static_cast<int>(kept.size()) >= keep_top_k) break;
-
         for (int j = i + 1; j < static_cast<int>(order.size()); ++j) {
-            const int idx_j = order[j];
-            if (suppressed[idx_j]) continue;
-            if (IoU(boxes->at(idx_i), boxes->at(idx_j)) > nms_threshold) {
-                suppressed[idx_j] = true;
-            }
+            int jj = order[j];
+            if (!suppressed[jj] && IoU(boxes->at(ii), boxes->at(jj)) > nms_threshold)
+                suppressed[jj] = true;
         }
     }
 
-    // Output: scale to original image coordinates
-    const float img_w = static_cast<float>(img_shape[0]);
-    const float img_h = static_cast<float>(img_shape[1]);
+    // 缩放到原图坐标
+    const float iw = static_cast<float>(img_shape[0]);
+    const float ih = static_cast<float>(img_shape[1]);
     result->Reserve(static_cast<int>(kept.size()));
 
     for (int idx : kept) {
-        // Scale bounding box
-        std::array<float, 4> box = boxes->at(idx);
-        box[0] = std::max(0.0f, std::min(box[0] * w_scale, img_w));
-        box[1] = std::max(0.0f, std::min(box[1] * h_scale, img_h));
-        box[2] = std::max(0.0f, std::min(box[2] * w_scale, img_w));
-        box[3] = std::max(0.0f, std::min(box[3] * h_scale, img_h));
-        result->boxes.emplace_back(box);
-        result->scores.emplace_back(scores->at(idx));
+        auto& b = boxes->at(idx);
+        result->boxes.push_back({
+            Clamp(b[0] * w_scale, 0, iw), Clamp(b[1] * h_scale, 0, ih),
+            Clamp(b[2] * w_scale, 0, iw), Clamp(b[3] * h_scale, 0, ih)
+        });
+        result->scores.push_back(scores->at(idx));
 
-        // Scale keypoints, clamp to image bounds
-        std::vector<std::array<float, 3>> scaled_kpts(kNumKeypoints);
+        std::vector<std::array<float, 3>> sk(kNumKeypoints);
         const auto& kpts = keypoints->at(idx);
         for (int k = 0; k < kNumKeypoints; ++k) {
-            scaled_kpts[k] = {
-                std::max(0.0f, std::min(kpts[k][0] * w_scale, img_w)),
-                std::max(0.0f, std::min(kpts[k][1] * h_scale, img_h)),
-                kpts[k][2]  // visibility unchanged
+            sk[k] = {
+                Clamp(kpts[k][0] * w_scale, 0, iw),
+                Clamp(kpts[k][1] * h_scale, 0, ih),
+                kpts[k][2]
             };
         }
-        result->keypoints.emplace_back(std::move(scaled_kpts));
+        result->keypoints.push_back(std::move(sk));
     }
 }
 
 
+// ============================================================================
+// Predict - 主推理入口 (含自适应阈值 + 诊断输出)
+// ============================================================================
 void HANDPOSEGRAY::Predict(ssne_tensor_t* img_in, HandPoseResult* result,
                            float conf_threshold) {
     result->Clear();
 
-    int ret = RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0]);
-    if (ret != 0) {
-        printf("[ERROR] HandPose RunAiPreprocessPipe failed, ret=%d\n", ret);
-        return;
-    }
-
-    ret = ssne_inference(model_id, 1, inputs);
-    if (ret != 0) {
-        fprintf(stderr, "[ERROR] HandPose ssne_inference fail! ret=%d\n", ret);
-        return;
-    }
-
+    if (RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0]) != 0) return;
+    if (ssne_inference(model_id, 1, inputs) != 0) return;
     ssne_getoutput(model_id, 9, outputs);
 
-    // Feature map sizes
-    const int feat_h_s8 = det_shape[1] / 8;
-    const int feat_w_s8 = det_shape[0] / 8;
-    const int feat_h_s16 = det_shape[1] / 16;
-    const int feat_w_s16 = det_shape[0] / 16;
-    const int feat_h_s32 = det_shape[1] / 32;
-    const int feat_w_s32 = det_shape[0] / 32;
+    // 特征图尺寸
+    const int fh8  = det_shape[1] / 8,  fw8  = det_shape[0] / 8;
+    const int fh16 = det_shape[1] / 16, fw16 = det_shape[0] / 16;
+    const int fh32 = det_shape[1] / 32, fw32 = det_shape[0] / 32;
 
-    // Expected tensor element counts
-    const uint32_t exp_cls_s8  = feat_h_s8  * feat_w_s8  * 1;
-    const uint32_t exp_cls_s16 = feat_h_s16 * feat_w_s16 * 1;
-    const uint32_t exp_cls_s32 = feat_h_s32 * feat_w_s32 * 1;
-    const uint32_t exp_box_s8  = feat_h_s8  * feat_w_s8  * 64;
-    const uint32_t exp_box_s16 = feat_h_s16 * feat_w_s16 * 64;
-    const uint32_t exp_box_s32 = feat_h_s32 * feat_w_s32 * 64;
-    const uint32_t exp_kpt_s8  = feat_h_s8  * feat_w_s8  * kKptChannels;
-    const uint32_t exp_kpt_s16 = feat_h_s16 * feat_w_s16 * kKptChannels;
-    const uint32_t exp_kpt_s32 = feat_h_s32 * feat_w_s32 * kKptChannels;
+    // 预期元素数 (9个tensor)
+    const uint32_t expect[9] = {
+        static_cast<uint32_t>(fh8  * fw8),                          // cls_s8
+        static_cast<uint32_t>(fh16 * fw16),                         // cls_s16
+        static_cast<uint32_t>(fh32 * fw32),                         // cls_s32
+        static_cast<uint32_t>(fh8  * fw8  * 64),                    // box_s8
+        static_cast<uint32_t>(fh16 * fw16 * 64),                    // box_s16
+        static_cast<uint32_t>(fh32 * fw32 * 64),                    // box_s32
+        static_cast<uint32_t>(fh8  * fw8  * kKptChannels),          // kpt_s8
+        static_cast<uint32_t>(fh16 * fw16 * kKptChannels),          // kpt_s16
+        static_cast<uint32_t>(fh32 * fw32 * kKptChannels),          // kpt_s32
+    };
 
-    float* cls_s8 = nullptr;  float* cls_s16 = nullptr;  float* cls_s32 = nullptr;
-    float* box_s8 = nullptr;  float* box_s16 = nullptr;  float* box_s32 = nullptr;
-    float* kpt_s8 = nullptr;  float* kpt_s16 = nullptr;  float* kpt_s32 = nullptr;
-
-    // One-time diagnostic: dump tensor sizes and raw value ranges
-    const bool debug_this_frame = kHandVerboseDebug &&
-                                  (g_hand_debug_frame_count < kHandDebugMaxFrames);
-    if (debug_this_frame) {
-        g_hand_debug_frame_count++;
-        printf("\n[DEBUG] === HandPose Frame %d ===\n", g_hand_debug_frame_count);
-    }
+    float* ptrs[9] = {};
 
     for (int i = 0; i < 9; ++i) {
-        uint32_t size = get_total_size(outputs[i]);
+        uint32_t sz = get_total_size(outputs[i]);
         float* data = reinterpret_cast<float*>(get_data(outputs[i]));
-
-        if (debug_this_frame) {
-            // Print tensor size and first few raw values
-            printf("[DEBUG] output[%d] size=%u", i, size);
-            if (data && size > 0) {
-                float vmin = data[0], vmax = data[0];
-                for (uint32_t j = 1; j < std::min(size, 1000u); ++j) {
-                    if (data[j] < vmin) vmin = data[j];
-                    if (data[j] > vmax) vmax = data[j];
-                }
-                printf(" range=[%.4f, %.4f]", vmin, vmax);
-            }
-            printf("\n");
-        }
-
-        if      (size == exp_cls_s8)  cls_s8  = data;
-        else if (size == exp_cls_s16) cls_s16 = data;
-        else if (size == exp_cls_s32) cls_s32 = data;
-        else if (size == exp_box_s8)  box_s8  = data;
-        else if (size == exp_box_s16) box_s16 = data;
-        else if (size == exp_box_s32) box_s32 = data;
-        else if (size == exp_kpt_s8)  kpt_s8  = data;
-        else if (size == exp_kpt_s16) kpt_s16 = data;
-        else if (size == exp_kpt_s32) kpt_s32 = data;
-        else {
-            printf("[WARN] HandPose output[%d] size=%u unmatched\n", i, size);
+        for (int e = 0; e < 9; ++e) {
+            if (sz == expect[e] && ptrs[e] == nullptr) { ptrs[e] = data; break; }
         }
     }
 
-    if (!cls_s8 || !cls_s16 || !cls_s32 ||
-        !box_s8 || !box_s16 || !box_s32 ||
-        !kpt_s8 || !kpt_s16 || !kpt_s32) {
-        printf("[ERROR] HandPose output tensor size mismatch!\n");
-        printf("  Expected cls(%u, %u, %u) box(%u, %u, %u) kpt(%u, %u, %u)\n",
-               exp_cls_s8, exp_cls_s16, exp_cls_s32,
-               exp_box_s8, exp_box_s16, exp_box_s32,
-               exp_kpt_s8, exp_kpt_s16, exp_kpt_s32);
-        printf("  Actual sizes:");
-        for (int i = 0; i < 9; ++i) {
-            printf(" [%d]=%u", i, get_total_size(outputs[i]));
-        }
+    // 检查所有 tensor 是否匹配
+    bool all_ok = true;
+    for (int i = 0; i < 9; ++i) {
+        if (!ptrs[i]) { all_ok = false; break; }
+    }
+    if (!all_ok) {
+        printf("[HAND] ERROR: tensor mismatch! Expected:");
+        for (int i = 0; i < 9; ++i) printf(" %u", expect[i]);
+        printf("\n  Actual:");
+        for (int i = 0; i < 9; ++i) printf(" %u", get_total_size(outputs[i]));
         printf("\n");
         return;
     }
 
-    // Log cls head stats for first few frames
-    if (debug_this_frame) {
-        for (int s = 0; s < 3; ++s) {
-            float* cls = (s == 0) ? cls_s8 : (s == 1) ? cls_s16 : cls_s32;
-            int sp = (s == 0) ? (feat_h_s8 * feat_w_s8) :
-                     (s == 1) ? (feat_h_s16 * feat_w_s16) :
-                                (feat_h_s32 * feat_w_s32);
-            int stride_val = (s == 0) ? 8 : (s == 1) ? 16 : 32;
-            float max_raw = -1e9f;
-            int max_idx = 0;
-            int above_thresh = 0;
-            for (int j = 0; j < sp; ++j) {
-                float sig = Sigmoid(cls[j]);
-                if (sig > conf_threshold) above_thresh++;
-                if (cls[j] > max_raw) { max_raw = cls[j]; max_idx = j; }
-            }
-            printf("[DEBUG] cls_s%d: spatial=%d max_raw=%.4f max_sig=%.4f above_thresh=%d\n",
-                   stride_val, sp, max_raw, Sigmoid(max_raw), above_thresh);
+    // ptrs[0..2] = cls_s8/s16/s32, ptrs[3..5] = box, ptrs[6..8] = kpt
+    float* cls_ptrs[3] = {ptrs[0], ptrs[1], ptrs[2]};
+    int    sp[3]       = {fh8 * fw8, fh16 * fw16, fh32 * fw32};
+
+    // ---- 自适应阈值: 统计所有 cls sigmoid 分数，只保留 top-N ----
+    std::vector<float> all_sigs;
+    all_sigs.reserve(300);
+    for (int s = 0; s < 3; ++s) {
+        for (int j = 0; j < sp[s]; ++j) {
+            float sig = Sigmoid(cls_ptrs[s][j]);
+            if (sig > conf_threshold * 0.5f) all_sigs.push_back(sig);
         }
     }
+    std::sort(all_sigs.rbegin(), all_sigs.rend());
 
+    float eff_conf = conf_threshold;
+    if (static_cast<int>(all_sigs.size()) > kAdaptiveTopN) {
+        eff_conf = std::max(conf_threshold, all_sigs[kAdaptiveTopN]);
+    }
+
+    // ---- 解码三个stride分支 ----
     std::vector<std::array<float, 4>> bboxes;
     std::vector<float> scores;
     std::vector<std::vector<std::array<float, 3>>> all_kpts;
 
-    DecodeBranch(cls_s8,  box_s8,  kpt_s8,  feat_h_s8,  feat_w_s8,  8,
-                 conf_threshold, &bboxes, &scores, &all_kpts);
-    DecodeBranch(cls_s16, box_s16, kpt_s16, feat_h_s16, feat_w_s16, 16,
-                 conf_threshold, &bboxes, &scores, &all_kpts);
-    DecodeBranch(cls_s32, box_s32, kpt_s32, feat_h_s32, feat_w_s32, 32,
-                 conf_threshold, &bboxes, &scores, &all_kpts);
+    DecodeBranch(ptrs[0], ptrs[3], ptrs[6], fh8,  fw8,  8,
+                 eff_conf, &bboxes, &scores, &all_kpts);
+    DecodeBranch(ptrs[1], ptrs[4], ptrs[7], fh16, fw16, 16,
+                 eff_conf, &bboxes, &scores, &all_kpts);
+    DecodeBranch(ptrs[2], ptrs[5], ptrs[8], fh32, fw32, 32,
+                 eff_conf, &bboxes, &scores, &all_kpts);
 
-    if (debug_this_frame) {
-        printf("[DEBUG] Pre-NMS candidates: %zu (threshold=%.2f)\n",
-               bboxes.size(), conf_threshold);
-        for (size_t i = 0; i < std::min(bboxes.size(), size_t(5)); ++i) {
-            printf("  [%zu] box=[%.0f,%.0f,%.0f,%.0f] score=%.3f\n",
-                   i, bboxes[i][0], bboxes[i][1], bboxes[i][2], bboxes[i][3], scores[i]);
+    // ---- NMS后处理 ----
+    Postprocess(&bboxes, &scores, &all_kpts, result, &eff_conf);
+
+    // ---- 诊断: 只在检测到手时打印前N次 ----
+    if (!result->boxes.empty() && g_debug_det_count < kDebugDetections) {
+        g_debug_det_count++;
+        printf("\n[HAND] ====== 检测诊断 %d/%d ======\n", g_debug_det_count, kDebugDetections);
+
+        // tensor值范围
+        const char* names[9] = {"cls8","cls16","cls32","box8","box16","box32","kpt8","kpt16","kpt32"};
+        for (int i = 0; i < 9; ++i) {
+            uint32_t sz = get_total_size(outputs[i]);
+            float* d = ptrs[i];
+            float vmin = d[0], vmax = d[0];
+            for (uint32_t j = 1; j < std::min(sz, 2000u); ++j) {
+                if (d[j] < vmin) vmin = d[j];
+                if (d[j] > vmax) vmax = d[j];
+            }
+            printf("[HAND] %s size=%u range=[%.3f, %.3f]\n", names[i], sz, vmin, vmax);
         }
-    }
 
-    Postprocess(&bboxes, &scores, &all_kpts, result, &conf_threshold);
+        // cls分数分布
+        printf("[HAND] 候选=%zu 自适应阈值=%.3f top-5:", all_sigs.size(), eff_conf);
+        for (int j = 0; j < std::min(5, static_cast<int>(all_sigs.size())); ++j)
+            printf(" %.3f", all_sigs[j]);
+        printf("\n");
 
-    if (debug_this_frame && !result->boxes.empty()) {
-        printf("[DEBUG] Post-NMS results: %zu hands\n", result->boxes.size());
+        printf("[HAND] 解码候选=%zu, NMS后=%zu只手\n", bboxes.size(), result->boxes.size());
         for (size_t i = 0; i < result->boxes.size(); ++i) {
-            printf("  hand[%zu] box=[%.1f,%.1f,%.1f,%.1f] score=%.3f\n",
+            printf("[HAND] hand[%zu] box=(%.0f,%.0f,%.0f,%.0f) score=%.3f\n",
                    i, result->boxes[i][0], result->boxes[i][1],
                    result->boxes[i][2], result->boxes[i][3], result->scores[i]);
-            // Print first 5 keypoints
-            if (i < result->keypoints.size()) {
-                for (int k = 0; k < std::min(5, kNumKeypoints); ++k) {
-                    const auto& kpt = result->keypoints[i][k];
-                    printf("    kpt[%d] x=%.1f y=%.1f vis=%.2f\n", k, kpt[0], kpt[1], kpt[2]);
-                }
+
+            // 打印该手的kpt原始值 (从NMS前的数据中查找对应的原始位置)
+            printf("[HAND] kpts(缩放后):");
+            for (int k = 0; k < kNumKeypoints; ++k) {
+                auto& kp = result->keypoints[i][k];
+                printf(" [%d](%.0f,%.0f,v=%.2f)", k, kp[0], kp[1], kp[2]);
             }
+            printf("\n");
         }
     }
 }
@@ -443,8 +384,6 @@ void HANDPOSEGRAY::Predict(ssne_tensor_t* img_in, HandPoseResult* result,
 
 void HANDPOSEGRAY::Release() {
     release_tensor(inputs[0]);
-    for (int i = 0; i < 9; ++i) {
-        release_tensor(outputs[i]);
-    }
+    for (int i = 0; i < 9; ++i) release_tensor(outputs[i]);
     ReleaseAIPreprocessPipe(pipe_offline);
 }

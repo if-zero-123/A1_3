@@ -82,8 +82,8 @@ constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 // ============================================================================
 // 手部姿态检测参数
 // ============================================================================
-constexpr float kHandInferConfThreshold = 0.25f;   // 手部检测置信度阈值
-constexpr float kHandKptVisThreshold = 0.3f;       // 关键点可见度阈值（低于此值不绘制）
+constexpr float kHandInferConfThreshold = 0.50f;   // 手部检测置信度阈值（提高以减少误检）
+constexpr float kHandKptVisThreshold = 0.5f;       // 关键点可见度阈值（提高以过滤低质量关键点）
 constexpr float kHandKptDotRadius = 3.0f;          // 关键点绘制半径
 constexpr int   kHandClearAfterMissFrames = 5;     // 连续N帧无检测后清除OSD
 
