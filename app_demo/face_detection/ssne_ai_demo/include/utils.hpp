@@ -30,8 +30,6 @@ class VISUALIZER {
     void Draw();
     void Draw(const std::vector<std::array<float, 4>>& boxes);
     void DrawCircles(const std::vector<std::array<float, 4>>& boxes);
-    void DrawHandBoxes(const std::vector<std::array<float, 4>>& boxes);
-    void DrawHandKeypoints(const std::vector<std::array<float, 4>>& kpt_boxes);
 
   private:
     // OSD设备实例

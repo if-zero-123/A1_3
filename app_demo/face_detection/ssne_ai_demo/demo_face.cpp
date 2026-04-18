@@ -79,15 +79,6 @@ constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
 // OSD 重绘参数（移除限频，仅保留位移门控）
 constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
 
-// ============================================================================
-// 手部姿态检测参数
-// ============================================================================
-constexpr float kHandInferConfThreshold = 0.50f;   // 手部检测置信度阈值（提高以减少误检）
-constexpr float kHandKptVisThreshold = 0.5f;       // 关键点可见度阈值（提高以过滤低质量关键点）
-constexpr float kHandKptDotRadius = 3.0f;          // 关键点绘制半径
-constexpr int   kHandClearAfterMissFrames = 5;     // 连续N帧无检测后清除OSD
-constexpr float kHandRedrawMinDelta = 2.0f;        // 小于2px的手部抖动不重绘
-
 // 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
 
 // CPU 轻量精定位参数：在 NPU 眼框（包含整个眼睛/眉毛轮廓）内寻找最暗区（瞳孔）中心
@@ -240,13 +231,6 @@ std::vector<std::array<float, 4>> g_last_drawn_boxes;
 int g_last_draw_frame = -10000;
 bool g_has_active_overlay = false;
 int g_consecutive_empty_frames = 0;
-
-// 手部姿态全局状态
-bool g_hand_has_active_overlay = false;
-int g_hand_consecutive_empty_frames = 0;
-std::vector<std::array<float, 4>> g_last_hand_drawn_boxes;
-std::vector<std::array<float, 4>> g_last_hand_drawn_kpt_boxes;
-int g_last_hand_draw_frame = -10000;
 
 // ============================================================================
 // 工具函数
@@ -761,34 +745,6 @@ bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) 
     return false;
 }
 
-bool ShouldRedrawHand(const std::vector<std::array<float, 4>>& hand_boxes,
-                      const std::vector<std::array<float, 4>>& kpt_boxes,
-                      int frame_id) {
-    if (g_last_hand_draw_frame < 0) return true;
-    if (hand_boxes.size() != g_last_hand_drawn_boxes.size()) return true;
-    if (kpt_boxes.size() != g_last_hand_drawn_kpt_boxes.size()) return true;
-
-    for (size_t i = 0; i < hand_boxes.size(); ++i) {
-        const float dx = std::fabs(CenterX(hand_boxes[i]) - CenterX(g_last_hand_drawn_boxes[i]));
-        const float dy = std::fabs((hand_boxes[i][1] + hand_boxes[i][3]) * 0.5f -
-                                   (g_last_hand_drawn_boxes[i][1] + g_last_hand_drawn_boxes[i][3]) * 0.5f);
-        if (dx > kHandRedrawMinDelta || dy > kHandRedrawMinDelta) {
-            return true;
-        }
-    }
-
-    for (size_t i = 0; i < kpt_boxes.size(); ++i) {
-        const float dx = std::fabs(CenterX(kpt_boxes[i]) - CenterX(g_last_hand_drawn_kpt_boxes[i]));
-        const float dy = std::fabs((kpt_boxes[i][1] + kpt_boxes[i][3]) * 0.5f -
-                                   (g_last_hand_drawn_kpt_boxes[i][1] + g_last_hand_drawn_kpt_boxes[i][3]) * 0.5f);
-        if (dx > kHandRedrawMinDelta || dy > kHandRedrawMinDelta) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box, float img_w, float img_h) {
     // 保持亚像素精度输入，只在最后显示前进行一次平滑
     const float cx = 0.5f * (eye_box[0] + eye_box[2]);
@@ -844,23 +800,21 @@ bool check_exit_flag() {
  */
 void inference_thread_func(EYEDETGRAY* eye_detector,
                            SCRFDGRAY* face_detector,
-                           HANDPOSEGRAY* hand_detector,
                            int dual_display_offset_y,
                            int img_width,
                            int img_height) {
     cout << "[Thread] Inference thread started!" << endl;
-
+    
     FaceDetectionResult* det_result1 = new FaceDetectionResult;
     FaceDetectionResult* face_result = new FaceDetectionResult;
-    HandPoseResult* hand_result = new HandPoseResult;
     std::array<float, 4> last_face_roi = {0.0f, 0.0f, 0.0f, 0.0f};
     bool has_face_roi = false;
     int face_miss_frames = 0;
-
+    
     while (!stop_inference) {
         ImagePair img_pair;
         bool has_image = false;
-
+        
         {
             std::unique_lock<std::mutex> lock(mtx_image);
             cv_image_ready.wait(lock, [] {
@@ -873,13 +827,11 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                 has_image = true;
             }
         }
-
+        
         if (!has_image) continue;
 
         const uint8_t* y_plane = reinterpret_cast<const uint8_t*>(get_data(img_pair.img1));
-
-        // ====== 第一路图像: 人脸 + 眼睛检测 ======
-
+        
         // 人脸低频检测
         if (face_detector != nullptr &&
             ((img_pair.frame_id % kFaceInferInterval) == 0 || !has_face_roi)) {
@@ -906,7 +858,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                               img_width,
                               img_height);
 
-        // 构造眼睛绘制列表
+        // 构造绘制列表
         std::vector<std::array<float, 4>> eye_dot_boxes;
         eye_dot_boxes.reserve(stable_boxes.size());
         for (const auto& b : stable_boxes) {
@@ -915,7 +867,7 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                                                    static_cast<float>(img_height)));
         }
 
-        // 眼睛无检测时处理
+        // 无检测时处理
         if (eye_dot_boxes.empty() && !has_face_roi) {
             g_consecutive_empty_frames += 1;
             if (g_visualizer != nullptr && g_has_active_overlay &&
@@ -928,89 +880,32 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
                 g_last_draw_frame = img_pair.frame_id;
                 g_consecutive_empty_frames = 0;
             }
-        } else {
-            g_consecutive_empty_frames = 0;
-
-            // OSD 限频重绘（眼睛+人脸）
-            if (g_visualizer != nullptr && ShouldRedraw(eye_dot_boxes, img_pair.frame_id)) {
-                std::vector<std::array<float, 4>> face_draw;
-                if (has_face_roi) {
-                    face_draw.push_back(last_face_roi);
-                }
-
-                g_visualizer->Draw(face_draw);
-                if (g_eye_draw_mode == 0) {
-                    g_visualizer->DrawCircles(eye_dot_boxes);
-                } else {
-                    g_visualizer->Draw(eye_dot_boxes);
-                }
-                g_last_drawn_boxes = eye_dot_boxes;
-                g_last_draw_frame = img_pair.frame_id;
-                g_has_active_overlay = true;
-            }
+            continue;
         }
 
-        // ====== 第二路图像: 手部姿态检测 ======
-        if (hand_detector != nullptr) {
-            hand_detector->Predict(&img_pair.img2, hand_result, kHandInferConfThreshold);
+        g_consecutive_empty_frames = 0;
 
-            if (!hand_result->boxes.empty()) {
-                g_hand_consecutive_empty_frames = 0;
-
-                // 构造手部检测框列表（加Y偏移）
-                std::vector<std::array<float, 4>> hand_boxes_draw;
-                hand_boxes_draw.reserve(hand_result->boxes.size());
-                for (const auto& box : hand_result->boxes) {
-                    hand_boxes_draw.push_back({
-                        box[0],
-                        box[1] + static_cast<float>(dual_display_offset_y),
-                        box[2],
-                        box[3] + static_cast<float>(dual_display_offset_y)
-                    });
-                }
-
-                // 构造关键点绘制列表（加Y偏移，过滤低可见度）
-                std::vector<std::array<float, 4>> kpt_dot_boxes;
-                kpt_dot_boxes.reserve(hand_result->keypoints.size() * HANDPOSEGRAY::kNumKeypoints);
-                for (const auto& kpts : hand_result->keypoints) {
-                    for (const auto& kpt : kpts) {
-                        if (kpt[2] < kHandKptVisThreshold) continue;  // 可见度过低，跳过
-                        const float kx = kpt[0];
-                        const float ky = kpt[1] + static_cast<float>(dual_display_offset_y);
-                        const float r = kHandKptDotRadius;
-                        kpt_dot_boxes.push_back({kx - r, ky - r, kx + r, ky + r});
-                    }
-                }
-
-                if (g_visualizer != nullptr &&
-                    ShouldRedrawHand(hand_boxes_draw, kpt_dot_boxes, img_pair.frame_id)) {
-                    g_visualizer->DrawHandBoxes(hand_boxes_draw);
-                    g_visualizer->DrawHandKeypoints(kpt_dot_boxes);
-                    g_last_hand_drawn_boxes = hand_boxes_draw;
-                    g_last_hand_drawn_kpt_boxes = kpt_dot_boxes;
-                    g_last_hand_draw_frame = img_pair.frame_id;
-                    g_hand_has_active_overlay = true;
-                }
-            } else {
-                g_hand_consecutive_empty_frames += 1;
-                if (g_visualizer != nullptr && g_hand_has_active_overlay &&
-                    g_hand_consecutive_empty_frames >= kHandClearAfterMissFrames) {
-                    std::vector<std::array<float, 4>> empty;
-                    g_visualizer->DrawHandBoxes(empty);
-                    g_visualizer->DrawHandKeypoints(empty);
-                    g_hand_has_active_overlay = false;
-                    g_last_hand_drawn_boxes.clear();
-                    g_last_hand_drawn_kpt_boxes.clear();
-                    g_last_hand_draw_frame = img_pair.frame_id;
-                    g_hand_consecutive_empty_frames = 0;
-                }
+        // 第4层：OSD 限频重绘
+        if (g_visualizer != nullptr && ShouldRedraw(eye_dot_boxes, img_pair.frame_id)) {
+            std::vector<std::array<float, 4>> face_draw;
+            if (has_face_roi) {
+                face_draw.push_back(last_face_roi);
             }
+
+            g_visualizer->Draw(face_draw);
+            if (g_eye_draw_mode == 0) {
+                g_visualizer->DrawCircles(eye_dot_boxes);
+            } else {
+                g_visualizer->Draw(eye_dot_boxes);
+            }
+            g_last_drawn_boxes = eye_dot_boxes;
+            g_last_draw_frame = img_pair.frame_id;
+            g_has_active_overlay = true;
         }
     }
-
+    
     delete det_result1;
     delete face_result;
-    delete hand_result;
     cout << "[Thread] Inference thread stopped!" << endl;
 }
 
@@ -1037,11 +932,9 @@ int main(int argc, char* argv[]) {
     
     array<int, 2> img_shape = {img_width, img_height};
     const int dual_display_offset_y = 480;
-
-    // OSD图层需要覆盖完整双屏显示区域（上半屏+下半屏 = 480*2=960）
-    std::array<int, 2> display_shape = {img_width, img_height * 2};
+    
     VISUALIZER visualizer;
-    visualizer.Initialize(display_shape);
+    visualizer.Initialize(img_shape);
     g_visualizer = &visualizer;
 
     IMAGEPROCESSOR processor;
@@ -1055,21 +948,13 @@ int main(int argc, char* argv[]) {
     int eye_box_len = eye_det_shape[0] * eye_det_shape[1];
     eye_detector.Initialize(path_eye_det, &img_shape, &eye_det_shape, eye_box_len);
 
-    // 手部姿态检测模型初始化
-    array<int, 2> hand_det_shape = {640, 480};
-    string path_hand_det = "/app_demo/app_assets/models/hand_pose.m1model";
-    HANDPOSEGRAY hand_detector;
-    int hand_box_len = hand_det_shape[0] * hand_det_shape[1];
-    hand_detector.Initialize(path_hand_det, &img_shape, &hand_det_shape, hand_box_len);
-
-    cout << "[INFO] Face+Eye+Hand Detection Models initialized!" << endl;
+    cout << "[INFO] Face+Eye Detection Models initialized!" << endl;
     cout << "sleep for 0.2 second!" << endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
+    
     std::thread inference_thread(inference_thread_func,
                                  &eye_detector,
                                  &face_detector,
-                                 &hand_detector,
                                  dual_display_offset_y,
                                  img_width,
                                  img_height);
@@ -1135,7 +1020,6 @@ int main(int argc, char* argv[]) {
     
     face_detector.Release();
     eye_detector.Release();
-    hand_detector.Release();
     processor.Release();
     visualizer.Release();
     
