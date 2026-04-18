@@ -17,9 +17,6 @@ constexpr int kEyeBoxLayerId = 4;
 // OSD layer index must be within [0, OSD_LAYER_SIZE-1].
 // Layer 5 may exceed valid range on this platform, causing add_quad_rangle_layer ret=-1.
 constexpr int kEyeCircleLayerId = 3;
-// 手部检测使用第0、1层
-constexpr int kHandBoxLayerId = 0;
-constexpr int kHandKptLayerId = 1;
 constexpr bool kOsdVerbose = false;
 }
 
@@ -125,59 +122,6 @@ void VISUALIZER::DrawCircles(const std::vector<std::array<float, 4>>& boxes) {
 
     // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
     osd_device.Draw(quad_rangle_vec, kEyeCircleLayerId);
-}
-
-/**
- * @brief 绘制手部检测框（空心矩形）
- * @param boxes 检测框向量，每个元素为[xmin, ymin, xmax, ymax]（已含Y偏移）
- */
-void VISUALIZER::DrawHandBoxes(const std::vector<std::array<float, 4>>& boxes) {
-    if (kOsdVerbose) {
-        printf("Drawing %zu hand boxes\n", boxes.size());
-    }
-
-    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
-
-    for (size_t i = 0; i < boxes.size(); i++) {
-        sst::device::osd::OsdQuadRangle q;
-        int xmin = static_cast<int>(boxes[i][0]);
-        int ymin = static_cast<int>(boxes[i][1]);
-        int xmax = static_cast<int>(boxes[i][2]);
-        int ymax = static_cast<int>(boxes[i][3]);
-        q.box = {static_cast<float>(xmin), static_cast<float>(ymin),
-                 static_cast<float>(xmax), static_cast<float>(ymax)};
-        q.color = 2;
-        q.border = 2;
-        q.alpha = fdevice::TYPE_ALPHA75;
-        q.type = fdevice::TYPE_HOLLOW;
-        quad_rangle_vec.emplace_back(q);
-    }
-
-    osd_device.Draw(quad_rangle_vec, kHandBoxLayerId);
-}
-
-/**
- * @brief 绘制手部关键点（实心小方块）
- * @param kpt_boxes 关键点方块向量，每个元素为[xmin, ymin, xmax, ymax]（已含Y偏移）
- */
-void VISUALIZER::DrawHandKeypoints(const std::vector<std::array<float, 4>>& kpt_boxes) {
-    if (kOsdVerbose) {
-        printf("Drawing %zu hand keypoints\n", kpt_boxes.size());
-    }
-
-    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
-
-    for (size_t i = 0; i < kpt_boxes.size(); i++) {
-        sst::device::osd::OsdQuadRangle q;
-        q.box = kpt_boxes[i];
-        q.color = 3;
-        q.border = 0;
-        q.alpha = fdevice::TYPE_ALPHA75;
-        q.type = fdevice::TYPE_SOLID;
-        quad_rangle_vec.emplace_back(q);
-    }
-
-    osd_device.Draw(quad_rangle_vec, kHandKptLayerId);
 }
 
 /**
