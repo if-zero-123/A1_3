@@ -55,6 +55,17 @@ constexpr float kEyeDotFixedRadius = 3.0f;          // 固定眼点半径（缩�
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
 constexpr int   kFaceInferInterval = 3;             // 人脸ROI刷新频率，降低ROI过期风险
 constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
+constexpr float kPoseInferConfThreshold = 0.22f;    // 手势/pose 推理阈值
+constexpr float kPoseDisplayScoreThreshold = 0.60f; // 手势显示/打印阈值，调试时优先改这里
+constexpr int   kPoseInferInterval = 3;             // 手势刷新频率
+constexpr int   kPoseInferPhase = 1;                // 与 face 交错，避免同帧叠加
+constexpr int   kPoseHoldFrames = 3;                // 手势结果短时保持，覆盖分时推理空窗
+constexpr int   kPoseClearAfterMissFrames = 3;      // 连续空帧后清屏
+constexpr float kPoseTrackSmoothAlpha = 0.35f;      // 手势框平滑系数
+constexpr float kPoseTrackMatchMinIoU = 0.08f;      // 手势跟踪最小IoU
+constexpr float kPoseTrackMaxCenterDistPx = 96.0f;  // 手势跟踪最大中心距离
+constexpr float kPoseClassSwitchMargin = 0.08f;     // 切换类别需要的额外置信优势
+constexpr int   kPoseClassSwitchConfirmFrames = 2;  // 切换类别需要连续确认次数
 
 // ============================================================================
 // Kalman滤波参数（针对CPU高精度亚像素坐标，必须大幅干掉R以消除延迟！）
@@ -223,11 +234,81 @@ struct EyeTrack {
     }
 };
 
+struct PoseTrack {
+    bool active = false;
+    std::array<float, 4> box = {0.0f, 0.0f, 0.0f, 0.0f};
+    int cls = -1;
+    float score = 0.0f;
+    int miss = 0;
+    int age = 0;
+    int pending_cls = -1;
+    int pending_count = 0;
+
+    void Reset() {
+        active = false;
+        box = {0.0f, 0.0f, 0.0f, 0.0f};
+        cls = -1;
+        score = 0.0f;
+        miss = 0;
+        age = 0;
+        pending_cls = -1;
+        pending_count = 0;
+    }
+
+    void Init(const std::array<float, 4>& det_box, int det_cls, float det_score) {
+        active = true;
+        box = det_box;
+        cls = det_cls;
+        score = det_score;
+        miss = 0;
+        age = 1;
+        pending_cls = -1;
+        pending_count = 0;
+    }
+
+    void Update(const std::array<float, 4>& det_box, int det_cls, float det_score) {
+        if (!active) {
+            Init(det_box, det_cls, det_score);
+            return;
+        }
+
+        const float a = kPoseTrackSmoothAlpha;
+        for (int i = 0; i < 4; ++i) {
+            box[i] = (1.0f - a) * box[i] + a * det_box[i];
+        }
+        score = 0.65f * score + 0.35f * det_score;
+        miss = 0;
+        age += 1;
+
+        if (det_cls == cls) {
+            pending_cls = -1;
+            pending_count = 0;
+            return;
+        }
+
+        if (pending_cls != det_cls) {
+            pending_cls = det_cls;
+            pending_count = 1;
+        } else {
+            pending_count += 1;
+        }
+
+        if (det_score >= score + kPoseClassSwitchMargin ||
+            pending_count >= kPoseClassSwitchConfirmFrames) {
+            cls = det_cls;
+            pending_cls = -1;
+            pending_count = 0;
+        }
+    }
+};
+
 // ============================================================================
 // 全局状态
 // ============================================================================
 EyeTrack g_eye_tracks[2];
+PoseTrack g_pose_track;
 std::vector<std::array<float, 4>> g_last_drawn_boxes;
+std::vector<int> g_last_drawn_classes;
 int g_last_draw_frame = -10000;
 bool g_has_active_overlay = false;
 int g_consecutive_empty_frames = 0;
@@ -256,6 +337,41 @@ float CenterDist2(const std::array<float, 4>& a, const std::array<float, 4>& b) 
     float dx = 0.5f * ((a[0] + a[2]) - (b[0] + b[2]));
     float dy = 0.5f * ((a[1] + a[3]) - (b[1] + b[3]));
     return dx * dx + dy * dy;
+}
+
+int SelectPrimaryPoseIndex(const std::vector<std::array<float, 4>>& boxes,
+                           const std::vector<int>& class_ids,
+                           const std::vector<float>& scores) {
+    const size_t n = std::min(boxes.size(), std::min(class_ids.size(), scores.size()));
+    if (n == 0) {
+        return -1;
+    }
+
+    int best_idx = -1;
+    float best_metric = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < n; ++i) {
+        float metric = scores[i];
+        if (g_pose_track.active) {
+            const float iou = ComputeIoU(g_pose_track.box, boxes[i]);
+            const float dist2 = CenterDist2(g_pose_track.box, boxes[i]);
+            const float dist = std::sqrt(std::max(0.0f, dist2));
+            const float proximity =
+                std::max(0.0f, 1.0f - dist / std::max(1.0f, kPoseTrackMaxCenterDistPx));
+            if (iou < kPoseTrackMatchMinIoU && proximity <= 0.0f) {
+                continue;
+            }
+            metric += 0.25f * iou + 0.12f * proximity;
+            if (class_ids[i] == g_pose_track.cls) {
+                metric += 0.05f;
+            }
+        }
+
+        if (metric > best_metric) {
+            best_metric = metric;
+            best_idx = static_cast<int>(i);
+        }
+    }
+    return best_idx;
 }
 
 bool SelectPrimaryFaceRoi(const FaceDetectionResult& face_result,
@@ -734,15 +850,100 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
 }
 
 // OSD 重绘判断（无限频，仅位移门控防闪烁）
-bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes, int frame_id) {
+bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes,
+                  const std::vector<int>* class_ids,
+                  int frame_id) {
     if (g_last_draw_frame < 0) return true;
     if (boxes.size() != g_last_drawn_boxes.size()) return true;
+    if (class_ids != nullptr) {
+        if (class_ids->size() != g_last_drawn_classes.size()) return true;
+        for (size_t i = 0; i < class_ids->size(); ++i) {
+            if ((*class_ids)[i] != g_last_drawn_classes[i]) return true;
+        }
+    }
     for (size_t i = 0; i < boxes.size(); ++i) {
         const float dx = std::fabs(CenterX(boxes[i]) - CenterX(g_last_drawn_boxes[i]));
         const float dy = std::fabs((boxes[i][1] + boxes[i][3]) * 0.5f - (g_last_drawn_boxes[i][1] + g_last_drawn_boxes[i][3]) * 0.5f);
         if (dx > kRedrawMinDelta || dy > kRedrawMinDelta) return true;
     }
     return false;
+}
+
+std::vector<std::array<float, 4>> OffsetBoxesY(
+    const std::vector<std::array<float, 4>>& boxes,
+    float offset_y) {
+    std::vector<std::array<float, 4>> shifted;
+    shifted.reserve(boxes.size());
+    for (const auto& box : boxes) {
+        shifted.push_back({box[0], box[1] + offset_y, box[2], box[3] + offset_y});
+    }
+    return shifted;
+}
+
+const char* PoseClassName(int class_id) {
+    switch (class_id) {
+        case 0: return "up";
+        case 1: return "ok";
+        case 2: return "down";
+        default: return "unknown";
+    }
+}
+
+void FilterPoseDetectionsForDisplay(const FaceDetectionResult& result,
+                                    float score_threshold,
+                                    std::vector<std::array<float, 4>>* boxes_out,
+                                    std::vector<int>* class_ids_out,
+                                    std::vector<float>* scores_out) {
+    boxes_out->clear();
+    class_ids_out->clear();
+    scores_out->clear();
+
+    const size_t n = std::min(result.boxes.size(),
+                              std::min(result.scores.size(), result.class_ids.size()));
+    boxes_out->reserve(n);
+    class_ids_out->reserve(n);
+    scores_out->reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (result.scores[i] < score_threshold) {
+            continue;
+        }
+        boxes_out->push_back(result.boxes[i]);
+        class_ids_out->push_back(result.class_ids[i]);
+        scores_out->push_back(result.scores[i]);
+    }
+}
+
+void PrintPoseSummary(const std::vector<int>& class_ids,
+                      const std::vector<float>& scores,
+                      int frame_id) {
+    if (class_ids.empty() || scores.empty()) {
+        return;
+    }
+    size_t best_idx = 0;
+    float best_score = -std::numeric_limits<float>::infinity();
+    const size_t n = std::min(class_ids.size(), scores.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (scores[i] > best_score) {
+            best_score = scores[i];
+            best_idx = i;
+        }
+    }
+
+    static int last_top_cls = -999;
+    static int last_count = -1;
+    static int last_log_frame = -1000;
+    const int top_cls = class_ids[best_idx];
+    const int count = static_cast<int>(n);
+    const bool changed = (top_cls != last_top_cls) || (count != last_count);
+    if (!changed && (frame_id - last_log_frame) < 30) {
+        return;
+    }
+
+    last_top_cls = top_cls;
+    last_count = count;
+    last_log_frame = frame_id;
+    printf("[POSE] frame=%d recognized=%s score=%.3f count=%d threshold=%.2f\n",
+           frame_id, PoseClassName(top_cls), scores[best_idx], count, kPoseDisplayScoreThreshold);
 }
 
 std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box, float img_w, float img_h) {
@@ -798,18 +999,22 @@ bool check_exit_flag() {
 /**
  * @brief 推理线程函数
  */
-void inference_thread_func(EYEDETGRAY* eye_detector,
+void inference_thread_func(POSEDETGRAY* pose_detector,
+                           EYEDETGRAY* eye_detector,
                            SCRFDGRAY* face_detector,
                            int dual_display_offset_y,
                            int img_width,
                            int img_height) {
     cout << "[Thread] Inference thread started!" << endl;
-    
-    FaceDetectionResult* det_result1 = new FaceDetectionResult;
+
+    FaceDetectionResult* pose_result = new FaceDetectionResult;
+    FaceDetectionResult* eye_result = new FaceDetectionResult;
     FaceDetectionResult* face_result = new FaceDetectionResult;
     std::array<float, 4> last_face_roi = {0.0f, 0.0f, 0.0f, 0.0f};
     bool has_face_roi = false;
     int face_miss_frames = 0;
+    bool has_pose_overlay = false;
+    int pose_miss_frames = 0;
     
     while (!stop_inference) {
         ImagePair img_pair;
@@ -831,10 +1036,12 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         if (!has_image) continue;
 
         const uint8_t* y_plane = reinterpret_cast<const uint8_t*>(get_data(img_pair.img1));
-        
-        // 人脸低频检测
+        const int face_infer_phase = img_pair.frame_id % kFaceInferInterval;
+        const int pose_infer_phase = img_pair.frame_id % kPoseInferInterval;
+
+        // 人脸低频检测：phase 0
         if (face_detector != nullptr &&
-            ((img_pair.frame_id % kFaceInferInterval) == 0 || !has_face_roi)) {
+            (face_infer_phase == 0 || !has_face_roi)) {
             face_detector->Predict(&img_pair.img1, face_result, kFaceInferConfThreshold);
             std::array<float, 4> current_face_roi;
             if (SelectPrimaryFaceRoi(*face_result, &current_face_roi)) {
@@ -849,34 +1056,86 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
             }
         }
 
-        // 眼睛检测（每帧）
-        eye_detector->Predict(&img_pair.img1, det_result1, kEyeInferConfThreshold);
+        // 眼睛实时检测：每帧
+        eye_detector->Predict(&img_pair.img1, eye_result, kEyeInferConfThreshold);
         std::vector<std::array<float, 4>> stable_boxes =
-            GetStableEyeBoxes(*det_result1,
+            GetStableEyeBoxes(*eye_result,
                               has_face_roi ? &last_face_roi : nullptr,
                               y_plane,
                               img_width,
                               img_height);
-
-        // 构造绘制列表
         std::vector<std::array<float, 4>> eye_dot_boxes;
         eye_dot_boxes.reserve(stable_boxes.size());
         for (const auto& b : stable_boxes) {
-            eye_dot_boxes.push_back(BuildEyeDotBox(b,
-                                                   static_cast<float>(img_width),
-                                                   static_cast<float>(img_height)));
+            eye_dot_boxes.push_back(BuildEyeDotBox(
+                b, static_cast<float>(img_width), static_cast<float>(img_height)));
         }
 
+        // pose/手势低频检测：phase 1，与 face 交错
+        if (pose_detector != nullptr &&
+            (pose_infer_phase == kPoseInferPhase || !has_pose_overlay)) {
+            pose_detector->Predict(&img_pair.img2, pose_result, kPoseInferConfThreshold);
+            std::vector<std::array<float, 4>> pose_display_boxes;
+            std::vector<int> pose_display_classes;
+            std::vector<float> pose_display_scores;
+            FilterPoseDetectionsForDisplay(*pose_result,
+                                           kPoseDisplayScoreThreshold,
+                                           &pose_display_boxes,
+                                           &pose_display_classes,
+                                           &pose_display_scores);
+            if (!pose_display_boxes.empty()) {
+                const int best_idx = SelectPrimaryPoseIndex(
+                    pose_display_boxes, pose_display_classes, pose_display_scores);
+                if (best_idx >= 0) {
+                    g_pose_track.Update(pose_display_boxes[best_idx],
+                                        pose_display_classes[best_idx],
+                                        pose_display_scores[best_idx]);
+                    has_pose_overlay = g_pose_track.active;
+                    pose_miss_frames = 0;
+
+                    std::vector<int> stable_classes(1, g_pose_track.cls);
+                    std::vector<float> stable_scores(1, g_pose_track.score);
+                    PrintPoseSummary(stable_classes, stable_scores, img_pair.frame_id);
+                }
+            } else if (has_pose_overlay) {
+                pose_miss_frames += 1;
+                if (pose_miss_frames > kPoseHoldFrames) {
+                    g_pose_track.Reset();
+                    has_pose_overlay = false;
+                }
+            }
+        }
+
+        std::vector<std::array<float, 4>> box_draw;
+        std::vector<int> box_draw_classes;
+        if (has_face_roi) {
+            box_draw.push_back(last_face_roi);
+            box_draw_classes.push_back(-1);
+        }
+        if (has_pose_overlay && g_pose_track.active) {
+            std::vector<std::array<float, 4>> stable_pose_boxes(1, g_pose_track.box);
+            std::vector<std::array<float, 4>> pose_boxes_display =
+                OffsetBoxesY(stable_pose_boxes, static_cast<float>(dual_display_offset_y));
+            box_draw.insert(box_draw.end(), pose_boxes_display.begin(), pose_boxes_display.end());
+            box_draw_classes.push_back(g_pose_track.cls);
+        }
+
+        std::vector<std::array<float, 4>> redraw_boxes = box_draw;
+        std::vector<int> redraw_classes = box_draw_classes;
+        redraw_boxes.insert(redraw_boxes.end(), eye_dot_boxes.begin(), eye_dot_boxes.end());
+        redraw_classes.insert(redraw_classes.end(), eye_dot_boxes.size(), -2);
+
         // 无检测时处理
-        if (eye_dot_boxes.empty() && !has_face_roi) {
+        if (redraw_boxes.empty()) {
             g_consecutive_empty_frames += 1;
             if (g_visualizer != nullptr && g_has_active_overlay &&
-                g_consecutive_empty_frames >= kClearAfterMissFrames) {
+                g_consecutive_empty_frames >= kPoseClearAfterMissFrames) {
                 std::vector<std::array<float, 4>> empty;
                 g_visualizer->Draw(empty);
                 g_visualizer->DrawCircles(empty);
                 g_has_active_overlay = false;
                 g_last_drawn_boxes.clear();
+                g_last_drawn_classes.clear();
                 g_last_draw_frame = img_pair.frame_id;
                 g_consecutive_empty_frames = 0;
             }
@@ -886,25 +1145,19 @@ void inference_thread_func(EYEDETGRAY* eye_detector,
         g_consecutive_empty_frames = 0;
 
         // 第4层：OSD 限频重绘
-        if (g_visualizer != nullptr && ShouldRedraw(eye_dot_boxes, img_pair.frame_id)) {
-            std::vector<std::array<float, 4>> face_draw;
-            if (has_face_roi) {
-                face_draw.push_back(last_face_roi);
-            }
-
-            g_visualizer->Draw(face_draw);
-            if (g_eye_draw_mode == 0) {
-                g_visualizer->DrawCircles(eye_dot_boxes);
-            } else {
-                g_visualizer->Draw(eye_dot_boxes);
-            }
-            g_last_drawn_boxes = eye_dot_boxes;
+        if (g_visualizer != nullptr &&
+            ShouldRedraw(redraw_boxes, &redraw_classes, img_pair.frame_id)) {
+            g_visualizer->Draw(box_draw, box_draw_classes);
+            g_visualizer->DrawCircles(eye_dot_boxes);
+            g_last_drawn_boxes = redraw_boxes;
+            g_last_drawn_classes = redraw_classes;
             g_last_draw_frame = img_pair.frame_id;
             g_has_active_overlay = true;
         }
     }
     
-    delete det_result1;
+    delete pose_result;
+    delete eye_result;
     delete face_result;
     cout << "[Thread] Inference thread stopped!" << endl;
 }
@@ -916,30 +1169,33 @@ int main(int argc, char* argv[]) {
     uint8_t load_flag = 0;
     int img_width = 640;
     int img_height = 480;
+    const int dual_display_offset_y = img_height;
     
     array<int, 2> eye_det_shape = {640, 480};
     string path_eye_det = "/app_demo/app_assets/models/eye.m1model";
-
-    g_eye_draw_mode = 0;
-    printf("[INFO] Eye draw mode: circle (forced)\n");
-
+    array<int, 2> pose_det_shape = {640, 480};
+    string path_pose_det = "/app_demo/app_assets/models/pose.m1model";
     array<int, 2> face_det_shape = {640, 480};
     string path_face_det = "/app_demo/app_assets/models/face_640x480.m1model";
+    g_eye_draw_mode = 0;
+    printf("[INFO] Eye draw mode: circle (forced)\n");
+    printf("[INFO] Pose class colors: up->1 ok->2 down->3\n");
+    printf("[INFO] Pose display threshold: %.2f\n", kPoseDisplayScoreThreshold);
     
     if (ssne_initial()) {
         fprintf(stderr, "SSNE initialization failed!\n");
     }
     
     array<int, 2> img_shape = {img_width, img_height};
-    const int dual_display_offset_y = 480;
+    array<int, 2> display_shape = {img_width, img_height * 2};
     
     VISUALIZER visualizer;
-    visualizer.Initialize(img_shape);
+    visualizer.Initialize(display_shape);
     g_visualizer = &visualizer;
 
     IMAGEPROCESSOR processor;
     processor.Initialize(&img_shape);
-    
+
     SCRFDGRAY face_detector;
     int face_box_len = face_det_shape[0] * face_det_shape[1];
     face_detector.Initialize(path_face_det, &img_shape, &face_det_shape, false, face_box_len);
@@ -948,11 +1204,16 @@ int main(int argc, char* argv[]) {
     int eye_box_len = eye_det_shape[0] * eye_det_shape[1];
     eye_detector.Initialize(path_eye_det, &img_shape, &eye_det_shape, eye_box_len);
 
-    cout << "[INFO] Face+Eye Detection Models initialized!" << endl;
+    POSEDETGRAY pose_detector;
+    int pose_box_len = pose_det_shape[0] * pose_det_shape[1];
+    pose_detector.Initialize(path_pose_det, &img_shape, &pose_det_shape, pose_box_len, 3);
+
+    cout << "[INFO] Face+Eye+Pose Detection Models initialized!" << endl;
     cout << "sleep for 0.2 second!" << endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     
     std::thread inference_thread(inference_thread_func,
+                                 &pose_detector,
                                  &eye_detector,
                                  &face_detector,
                                  dual_display_offset_y,
@@ -1018,6 +1279,7 @@ int main(int argc, char* argv[]) {
         cout << "[INFO] Inference thread joined successfully!" << endl;
     }
     
+    pose_detector.Release();
     face_detector.Release();
     eye_detector.Release();
     processor.Release();

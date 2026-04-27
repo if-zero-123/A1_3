@@ -18,6 +18,14 @@ constexpr int kEyeBoxLayerId = 4;
 // Layer 5 may exceed valid range on this platform, causing add_quad_rangle_layer ret=-1.
 constexpr int kEyeCircleLayerId = 3;
 constexpr bool kOsdVerbose = false;
+
+int BoxColorFromClassId(int class_id) {
+    // Keep colors in a small valid range for the LUT on device.
+    if (class_id < 0) {
+        return 1;
+    }
+    return 1 + (class_id % 3);
+}
 }
 
 
@@ -46,7 +54,7 @@ void VISUALIZER::Draw() {
 
 	// 配置测试矩形框参数
 	q.color = 0;                         // 颜色索引0
-	q.box = {100, 100, 200, 200};        // 矩形框坐标 [xmin, ymin, xmax, ymax]
+	q.box = {100.0f, 100.0f, 200.0f, 200.0f};  // 矩形框坐标 [xmin, ymin, xmax, ymax]
 	q.border = 3;                        // 边框宽度3像素
 	q.alpha = fdevice::TYPE_ALPHA75;     // 透明度75%
 	q.type = fdevice::TYPE_HOLLOW;       // 空心矩形
@@ -79,7 +87,12 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
         int xmax = static_cast<int>(boxes[i][2]);  // 右下角x坐标
         int ymax = static_cast<int>(boxes[i][3]);  // 右下角y坐标
         
-        q.box = {xmin, ymin, xmax, ymax};  // 设置矩形框坐标
+        q.box = {
+            static_cast<float>(xmin),
+            static_cast<float>(ymin),
+            static_cast<float>(xmax),
+            static_cast<float>(ymax)
+        };  // 设置矩形框坐标
         
         // 设置矩形框样式参数
         q.color = 1;                         // 颜色索引1（不同于测试框）
@@ -91,6 +104,30 @@ void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes) {
     }
 
     // 使用固定图层绘制，避免空框时清理所有图层导致整屏闪烁
+    osd_device.Draw(quad_rangle_vec, kEyeBoxLayerId);
+}
+
+void VISUALIZER::Draw(const std::vector<std::array<float, 4>>& boxes,
+                      const std::vector<int>& class_ids) {
+    if (class_ids.size() != boxes.size()) {
+        Draw(boxes);
+        return;
+    }
+    if (kOsdVerbose) {
+        printf("Drawing %zu detection boxes with class colors\n", boxes.size());
+    }
+
+    std::vector<sst::device::osd::OsdQuadRangle> quad_rangle_vec;
+    for (size_t i = 0; i < boxes.size(); i++) {
+        sst::device::osd::OsdQuadRangle q;
+        q.box = boxes[i];
+        q.color = BoxColorFromClassId(class_ids[i]);
+        q.border = 3;
+        q.alpha = fdevice::TYPE_ALPHA75;
+        q.type = fdevice::TYPE_HOLLOW;
+        quad_rangle_vec.emplace_back(q);
+    }
+
     osd_device.Draw(quad_rangle_vec, kEyeBoxLayerId);
 }
 

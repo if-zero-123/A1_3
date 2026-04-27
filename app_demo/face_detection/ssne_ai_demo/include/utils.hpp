@@ -29,6 +29,7 @@ class VISUALIZER {
     void Release();
     void Draw();
     void Draw(const std::vector<std::array<float, 4>>& boxes);
+    void Draw(const std::vector<std::array<float, 4>>& boxes, const std::vector<int>& class_ids);
     void DrawCircles(const std::vector<std::array<float, 4>>& boxes);
 
   private:

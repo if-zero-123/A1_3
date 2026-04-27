@@ -33,6 +33,11 @@ struct FaceDetectionResult {
    */
   std::vector<float> scores;
   /** \brief
+   * Optional class id for each detection. When unused (e.g. face/eye single-class paths),
+   * this vector may stay empty.
+   */
+  std::vector<int> class_ids;
+  /** \brief
    * `landmarks_per_face` indicates the number of face landmarks for each detected face
    * if the model's output contains face landmarks (such as YOLOv5Face, SCRFD, ...)
   */
@@ -211,4 +216,42 @@ class EYEDETGRAY {
                       std::vector<float>* scores) const;
     void Postprocess(std::vector<std::array<float, 4>>* boxes, std::vector<float>* scores,
                      FaceDetectionResult* result, float* conf_threshold);
+};
+
+class POSEDETGRAY {
+  public:
+    std::string ModelName() const { return "pose_det_gray"; }
+
+    void Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, float conf_threshold = 0.25f);
+    void Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
+                    std::array<int, 2>* in_det_shape, int in_box_len, int in_num_classes = 3);
+
+    float nms_threshold;
+    int keep_top_k;
+    int top_k;
+    std::array<int, 2> img_shape;
+    std::array<int, 2> det_shape;
+    int box_len;
+    int num_classes;
+    float w_scale;
+    float h_scale;
+    float min_box_size;
+    std::vector<int> steps;
+    std::string debug_model_path;
+    int debug_input_dtype;
+    int debug_predict_count;
+
+    void Release();
+
+  private:
+    uint16_t model_id = 0;
+    ssne_tensor_t inputs[1];
+    ssne_tensor_t outputs[6];
+    AiPreprocessPipe pipe_offline = GetAIPreprocessPipe();
+
+    void DecodeBranch(const float* cls_head, const float* box_head,
+                      int feat_h, int feat_w, int stride,
+                      float conf_threshold,
+                      FaceDetectionResult* result) const;
+    void Postprocess(FaceDetectionResult* result, float* conf_threshold);
 };
