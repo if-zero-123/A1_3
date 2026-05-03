@@ -29,6 +29,10 @@ constexpr float kPoseAreaPreferredHighRatio = 0.20f;
 constexpr float kPoseEdgeMarginRatio = 0.08f;
 constexpr float kPoseGeometryRejectThreshold = 0.12f;
 constexpr float kPoseLowScoreGeometryGate = 0.36f;
+constexpr int kPoseOkClassId = 1;
+constexpr float kPoseOkMetricBoost = 0.08f;
+constexpr float kPoseOkQualityBoost = 0.04f;
+constexpr float kPoseOkScoreRelax = 0.04f;
 
 struct PoseCandidate {
     std::array<float, 4> box;
@@ -423,8 +427,14 @@ void POSEDETGRAY::Postprocess(FaceDetectionResult* result, float* conf_threshold
         if (BoxArea(box) > max_box_area) continue;
         const float quality = ComputePoseGeometryQuality(box, det_shape[0], det_shape[1]);
         if (quality < kPoseGeometryRejectThreshold) continue;
-        const float assisted_score = result->scores[i] + 0.10f * quality;
-        if (result->scores[i] < (*conf_threshold + 0.04f) && quality < kPoseLowScoreGeometryGate) {
+        const bool is_ok = (result->class_ids[i] == kPoseOkClassId);
+        const float effective_conf = is_ok ? std::max(0.0f, *conf_threshold - kPoseOkScoreRelax)
+                                           : *conf_threshold;
+        if (result->scores[i] < effective_conf) continue;
+        const float assisted_score =
+            result->scores[i] + 0.10f * quality +
+            (is_ok ? (kPoseOkMetricBoost + kPoseOkQualityBoost * quality) : 0.0f);
+        if (result->scores[i] < (effective_conf + 0.04f) && quality < kPoseLowScoreGeometryGate) {
             continue;
         }
 
