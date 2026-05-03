@@ -52,11 +52,11 @@ constexpr float kEyeMinBoxSize = 3.0f;             // 过滤极小框
 constexpr int   kEyeHoldFrames = 0;                // 丢检不保持，避免预测漂移
 constexpr int   kClearAfterMissFrames = 3;          // 连续空帧后清屏，避免残留漂移
 constexpr float kEyeDotFixedRadius = 3.0f;          // 固定眼点半径（缩小为原来的3像素，避免过大遮挡）
-constexpr float kEyeOutputDeadzonePx = 0.60f;       // 小位移直接保持，减少静态抖动
-constexpr float kEyeOutputMotionScalePx = 4.5f;     // 超出 deadzone 后的过渡尺度
-constexpr float kEyeOutputSmoothAlphaCalm = 0.18f;  // 静止时更稳
-constexpr float kEyeOutputSmoothAlphaActive = 0.72f;  // 运动时更跟手
-constexpr float kEyeOutputSizeAlpha = 0.24f;        // 眼框尺寸输出平滑
+constexpr float kEyeOutputDeadzonePx = 0.35f;       // 只压极小抖动，不牺牲跟手
+constexpr float kEyeOutputMotionScalePx = 1.40f;    // 轻微运动后尽快贴近真实位置
+constexpr float kEyeOutputSmoothAlphaCalm = 0.55f;  // 静止时仍保留一定稳定
+constexpr float kEyeOutputSmoothAlphaActive = 1.00f;  // 运动时直接贴近目标
+constexpr float kEyeOutputSizeAlpha = 0.60f;        // 尺寸跟随更快，减少拖尾
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
 constexpr int   kFaceInferInterval = 3;             // 人脸ROI刷新频率，降低ROI过期风险
 constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
@@ -126,10 +126,11 @@ constexpr int   kPupilThresholdBias = 6;              // 阈值自适应偏移
 constexpr float kPupilMinAreaRatio = 0.0025f;
 constexpr float kPupilMaxAreaRatio = 0.50f;
 // 允许瞳孔在整个眼眶范围内任意游走（不再被限制在中心）
-constexpr float kPupilMaxShiftRatio = 0.50f;          // 允许偏离中心 50%（斜视时瞳孔在框的边缘）
-constexpr float kPupilMaxShiftPixels = 15.0f;         // 绝对允许偏移量放宽
-// 核心：100% 相信 CPU 给出的无抖动精确坐标！！绝不动摇！！
-constexpr float kPupilBlendRatio = 0.84f;
+constexpr float kPupilMaxShiftRatio = 0.44f;          // 仍允许大视角，但收紧异常跳点
+constexpr float kPupilMaxShiftPixels = 12.0f;         // 收紧绝对跳变
+constexpr float kPupilRefineMinConfidence = 0.22f;    // 低质量暗斑不参与修正
+constexpr float kPupilBlendRatioMin = 0.58f;          // 低置信时保留更多检测框中心
+constexpr float kPupilBlendRatioMax = 0.97f;          // 高置信时几乎完全相信 CPU 精定位
 constexpr int   kPupilMinRoiSide = 10;
 
 // ============================================================================
@@ -252,7 +253,8 @@ struct EyeTrack {
             const float dist = std::sqrt(dx * dx + dy * dy);
             if (dist > kEyeOutputDeadzonePx) {
                 const float motion =
-                    Clamp01((dist - kEyeOutputDeadzonePx) / std::max(0.5f, kEyeOutputMotionScalePx));
+                    std::max(0.0f, std::min(1.0f,
+                        (dist - kEyeOutputDeadzonePx) / std::max(0.5f, kEyeOutputMotionScalePx)));
                 const float alpha =
                     kEyeOutputSmoothAlphaCalm +
                     (kEyeOutputSmoothAlphaActive - kEyeOutputSmoothAlphaCalm) * motion;
@@ -802,6 +804,7 @@ struct BlobCandidate {
     float score = -1.0f;
     float cx = 0.0f;
     float cy = 0.0f;
+    float confidence = 0.0f;
 };
 
 bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
@@ -812,8 +815,10 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
                                  int roi_h,
                                  int threshold,
                                  float* cx_out,
-                                 float* cy_out) {
-    if (y_plane == nullptr || cx_out == nullptr || cy_out == nullptr) {
+                                 float* cy_out,
+                                 float* confidence_out) {
+    if (y_plane == nullptr || cx_out == nullptr || cy_out == nullptr ||
+        confidence_out == nullptr) {
         return false;
     }
     if (roi_w <= 0 || roi_h <= 0) {
@@ -929,16 +934,27 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             // 回归以“极暗度”为主，辅以面积，弱化距离惩罚（让瞳孔能走到视线边缘）
             float score = (255.0f - mean_dark) * std::sqrt(static_cast<float>(area)) * fill_ratio /
                           (1.0f + 0.002f * dist2);
+
+            const float darkness_quality = Clamp01((255.0f - mean_dark) / 120.0f);
+            const float area_quality = Clamp01(
+                (static_cast<float>(area) - static_cast<float>(min_area)) /
+                std::max(1.0f, static_cast<float>(max_area - min_area)));
+            const float center_quality = Clamp01(1.0f - std::sqrt(dist2) /
+                (0.55f * std::max(1.0f, static_cast<float>(std::min(roi_w, roi_h)))));
+            float confidence =
+                0.45f * darkness_quality + 0.30f * fill_ratio + 0.15f * area_quality + 0.10f * center_quality;
                           
             // 触碰边界的稍微扣分（因为眼框裁取得很紧凑，真的瞳孔是有可能贴边的）
             if (touches_border) {
                 score *= 0.65f;
+                confidence *= 0.82f;
             }
 
             if (score > best.score) {
                 best.score = score;
                 best.cx = cx;
                 best.cy = cy;
+                best.confidence = confidence;
             }
         }
     }
@@ -949,6 +965,7 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
 
     *cx_out = best.cx;
     *cy_out = best.cy;
+    *confidence_out = best.confidence;
     return true;
 }
 
@@ -992,6 +1009,7 @@ bool RefineEyeBoxByCpuPupil(const std::array<float, 4>& eye_box,
 
     float refined_cx = 0.0f;
     float refined_cy = 0.0f;
+    float refine_confidence = 0.0f;
     if (!FindPupilCenterFromDarkBlob(y_plane,
                                      img_w,
                                      roi_x1,
@@ -1000,7 +1018,11 @@ bool RefineEyeBoxByCpuPupil(const std::array<float, 4>& eye_box,
                                      roi_h,
                                      threshold,
                                      &refined_cx,
-                                     &refined_cy)) {
+                                     &refined_cy,
+                                     &refine_confidence)) {
+        return false;
+    }
+    if (refine_confidence < kPupilRefineMinConfidence) {
         return false;
     }
 
@@ -1013,8 +1035,10 @@ bool RefineEyeBoxByCpuPupil(const std::array<float, 4>& eye_box,
         return false;
     }
 
-    const float blended_cx = (1.0f - kPupilBlendRatio) * orig_cx + kPupilBlendRatio * refined_cx;
-    const float blended_cy = (1.0f - kPupilBlendRatio) * orig_cy + kPupilBlendRatio * refined_cy;
+    const float blend_ratio = kPupilBlendRatioMin +
+        (kPupilBlendRatioMax - kPupilBlendRatioMin) * Clamp01(refine_confidence);
+    const float blended_cx = (1.0f - blend_ratio) * orig_cx + blend_ratio * refined_cx;
+    const float blended_cy = (1.0f - blend_ratio) * orig_cy + blend_ratio * refined_cy;
 
     std::array<float, 4> out = {
         blended_cx - 0.5f * bw,
