@@ -41,7 +41,7 @@ void OsdDevice::Initialize(int width, int height){
     // init quad-rangle layer
     int dma_size = 1024;
     for(int layer_index = 0; layer_index < OSD_LAYER_SIZE; layer_index++){
-        osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, dma_size);sleep(0.25);
+        osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma, dma_size);
         osd_alloc_buffer(m_osd_handle, m_layer_dma[layer_index].dma_2, dma_size);
         int dma_fd = osd_get_buffer_fd(m_osd_handle, m_layer_dma[layer_index].dma);
 
@@ -120,18 +120,15 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle){
 void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
     if ((quad_rangle.size() == 0)){
         osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
-        printf("Draw --- osd_clean_layer\n");
         return;
     }
     int ret = 0;
 
     // generate qrangle box
     for(auto &q : quad_rangle){
-        printf("Draw --- q.box: %f, %f, %f, %f\n", q.box[0], q.box[1], q.box[2], q.box[3]);
         GenQrangleBox(q.box, q.border);
         COVER_ATTR_S qrangle_attr = {q.color, q.type, q.alpha, m_qrangle_out, m_qrangle_in};
         ret = osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);   
-        printf("Draw --- osd_add_quad_rangle_layer ret: %d\n", ret);
     }
     
     // flush data to ddr

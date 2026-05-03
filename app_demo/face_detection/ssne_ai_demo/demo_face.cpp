@@ -52,14 +52,15 @@ constexpr float kEyeMinBoxSize = 3.0f;             // 过滤极小框
 constexpr int   kEyeHoldFrames = 0;                // 丢检不保持，避免预测漂移
 constexpr int   kClearAfterMissFrames = 3;          // 连续空帧后清屏，避免残留漂移
 constexpr float kEyeDotFixedRadius = 3.0f;          // 固定眼点半径（缩小为原来的3像素，避免过大遮挡）
-constexpr float kEyeOutputDeadzonePx = 0.35f;       // 只压极小抖动，不牺牲跟手
-constexpr float kEyeOutputMotionScalePx = 1.40f;    // 轻微运动后尽快贴近真实位置
-constexpr float kEyeOutputSmoothAlphaCalm = 0.55f;  // 静止时仍保留一定稳定
+constexpr float kEyeOutputDeadzonePx = 0.18f;       // 仅抑制极轻微抖动
+constexpr float kEyeOutputMotionScalePx = 0.70f;    // 小位移后就快速跟随
+constexpr float kEyeOutputSmoothAlphaCalm = 0.82f;  // 静态也尽量贴近真实中心
 constexpr float kEyeOutputSmoothAlphaActive = 1.00f;  // 运动时直接贴近目标
-constexpr float kEyeOutputSizeAlpha = 0.60f;        // 尺寸跟随更快，减少拖尾
+constexpr float kEyeOutputSizeAlpha = 0.85f;        // 尺寸跟随更快，减少拖尾
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
-constexpr int   kFaceInferInterval = 3;             // 人脸ROI刷新频率，降低ROI过期风险
-constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
+constexpr int   kFaceInferIntervalFast = 2;         // 丢失ROI时快速重抓
+constexpr int   kFaceInferIntervalStable = 5;       // 稳定后降低刷新占用
+constexpr int   kFaceRoiHoldFrames = 12;            // 人脸ROI保持
 constexpr float kPoseInferConfThreshold = 0.22f;          // 手势/pose 推理阈值
 constexpr float kPoseDisplayScoreThreshold = 0.62f;       // 手势首次显示/新目标阈值
 constexpr float kPoseDisplayScoreThresholdTracked = 0.48f;  // 已锁定同类目标保持阈值
@@ -93,11 +94,11 @@ constexpr int   kPoseOkSwitchOutConfirmFrames = 3;        // 从 OK 切走时需
 // Kalman滤波参数（针对CPU高精度亚像素坐标，必须大幅干掉R以消除延迟！）
 // CPU直接算出来的是精准质心，所以 R 应当极小，否则会导致滞后(漂移)
 // ============================================================================
-constexpr float kKalmanQPos = 2.0f;      // 位置过程噪声（大幅提高以紧紧跟手）
-constexpr float kKalmanQVel = 0.5f;      // 速度过程噪声
-constexpr float kKalmanRCalm = 4.0f;     // 静止时过滤眼皮微表情带来的阈值扰动
-constexpr float kKalmanRActive = 0.5f;   // 运动时绝对信任当前帧（消除拖尾/漂移）
-constexpr float kResidualThresh = 3.0f;  // 残差超过3px就认为是主动运动
+constexpr float kKalmanQPos = 3.2f;      // 位置过程噪声，提高跟手性
+constexpr float kKalmanQVel = 0.9f;      // 速度过程噪声
+constexpr float kKalmanRCalm = 3.2f;     // 静止时保留平滑，但不再过重
+constexpr float kKalmanRActive = 0.22f;  // 运动时更快贴近当前帧
+constexpr float kResidualThresh = 1.8f;  // 更早判定为真实运动
 
 // IoU匹配参数
 constexpr float kIoUMatchThreshold = 0.10f;
@@ -110,7 +111,7 @@ constexpr float kTrackAreaRatioMax = 2.80f;
 constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
 
 // OSD 重绘参数（移除限频，仅保留位移门控）
-constexpr float kRedrawMinDelta = 1.5f;     // 移动<1.5px不重绘
+constexpr float kRedrawMinDelta = 2.0f;     // 提高重绘门槛，降低闪烁和OSD负载
 
 // 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
 
@@ -598,6 +599,13 @@ std::vector<int> g_last_drawn_classes;
 int g_last_draw_frame = -10000;
 bool g_has_active_overlay = false;
 int g_consecutive_empty_frames = 0;
+
+int GetFaceInferInterval(bool has_face_roi, int face_miss_frames) {
+    if (!has_face_roi || face_miss_frames > 0) {
+        return kFaceInferIntervalFast;
+    }
+    return kFaceInferIntervalStable;
+}
 
 bool ShouldRunPoseInference(int frame_id, bool has_pose_overlay) {
     const int phase = frame_id % kPoseInferInterval;
@@ -1312,6 +1320,9 @@ void PrintPoseSummary(const std::vector<int>& class_ids,
     static int last_count = -1;
     static int last_log_frame = -1000;
     const int top_cls = class_ids[best_idx];
+    if (!IsOkPoseClass(top_cls)) {
+        return;
+    }
     const int count = static_cast<int>(n);
     const bool changed = (top_cls != last_top_cls) || (count != last_count);
     if (!changed && (frame_id - last_log_frame) < 30) {
@@ -1415,7 +1426,8 @@ void inference_thread_func(POSEDETGRAY* pose_detector,
         if (!has_image) continue;
 
         const uint8_t* y_plane = reinterpret_cast<const uint8_t*>(get_data(img_pair.img1));
-        const int face_infer_phase = img_pair.frame_id % kFaceInferInterval;
+        const int face_infer_interval = GetFaceInferInterval(has_face_roi, face_miss_frames);
+        const int face_infer_phase = img_pair.frame_id % face_infer_interval;
         // 人脸低频检测：phase 0
         if (face_detector != nullptr &&
             (face_infer_phase == 0 || !has_face_roi)) {
@@ -1647,18 +1659,18 @@ int main(int argc, char* argv[]) {
         }
         res = start_isp_debug_load();
         
+        ImagePair img_pair;
+        img_pair.img1 = img_sensor[0];
+        img_pair.img2 = img_sensor[1];
+        img_pair.frame_id = num_frames;
         {
             std::unique_lock<std::mutex> lock(mtx_image);
             if (image_queue.size() >= MAX_QUEUE_SIZE) {
                 image_queue.pop();
             }
-            ImagePair img_pair;
-            img_pair.img1 = img_sensor[0];
-            img_pair.img2 = img_sensor[1];
-            img_pair.frame_id = num_frames;
             image_queue.push(img_pair);
-            cv_image_ready.notify_one();
         }
+        cv_image_ready.notify_one();
         num_frames += 1;
     }
     
