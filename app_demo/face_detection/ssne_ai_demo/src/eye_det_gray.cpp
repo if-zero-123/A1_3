@@ -244,11 +244,11 @@ void WeightedBoxFusion(const std::vector<std::array<float, 4>>& boxes,
 void EYEDETGRAY::Initialize(std::string& model_path, std::array<int, 2>* in_img_shape,
                             std::array<int, 2>* in_det_shape, int in_box_len) {
     nms_threshold = 0.35f;     // WBF 融合阈值
-    keep_top_k = 4;
-    top_k = 30;                // 更多候选给 WBF
+    keep_top_k = 3;
+    top_k = 18;                // 减少候选数，降低后处理开销
     eye_pair_only = true;
     min_box_size = 3.0f;       // 过滤噪声产生的微小框
-    pair_candidates = 12;
+    pair_candidates = 8;
     pair_y_thresh = 1.5f;
     pair_size_ratio_thresh = 2.5f;
     printf("[INFO] Eye postprocess: WBF fusion, pair_only=%d min_box=%.1f top_k=%d\n",
