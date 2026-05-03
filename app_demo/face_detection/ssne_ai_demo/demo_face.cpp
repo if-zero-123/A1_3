@@ -55,17 +55,27 @@ constexpr float kEyeDotFixedRadius = 3.0f;          // 固定眼点半径（缩�
 constexpr float kFaceInferConfThreshold = 0.45f;    // 人脸检测阈值
 constexpr int   kFaceInferInterval = 3;             // 人脸ROI刷新频率，降低ROI过期风险
 constexpr int   kFaceRoiHoldFrames = 10;            // 人脸ROI保持
-constexpr float kPoseInferConfThreshold = 0.22f;    // 手势/pose 推理阈值
-constexpr float kPoseDisplayScoreThreshold = 0.60f; // 手势显示/打印阈值，调试时优先改这里
-constexpr int   kPoseInferInterval = 3;             // 手势刷新频率
-constexpr int   kPoseInferPhase = 1;                // 与 face 交错，避免同帧叠加
-constexpr int   kPoseHoldFrames = 3;                // 手势结果短时保持，覆盖分时推理空窗
-constexpr int   kPoseClearAfterMissFrames = 3;      // 连续空帧后清屏
-constexpr float kPoseTrackSmoothAlpha = 0.35f;      // 手势框平滑系数
-constexpr float kPoseTrackMatchMinIoU = 0.08f;      // 手势跟踪最小IoU
-constexpr float kPoseTrackMaxCenterDistPx = 96.0f;  // 手势跟踪最大中心距离
-constexpr float kPoseClassSwitchMargin = 0.08f;     // 切换类别需要的额外置信优势
-constexpr int   kPoseClassSwitchConfirmFrames = 2;  // 切换类别需要连续确认次数
+constexpr float kPoseInferConfThreshold = 0.22f;          // 手势/pose 推理阈值
+constexpr float kPoseDisplayScoreThreshold = 0.62f;       // 手势首次显示/新目标阈值
+constexpr float kPoseDisplayScoreThresholdTracked = 0.48f;  // 已锁定同类目标保持阈值
+constexpr float kPoseDisplayScoreThresholdSwitch = 0.70f;   // 切类阈值
+constexpr float kPoseImmediateAcceptScore = 0.82f;        // 超高置信度单帧直通阈值
+constexpr int   kPoseInferInterval = 3;                   // 手势推理调度周期
+constexpr int   kPoseInferPhase = 1;                      // 稳态时仅在该 phase 推理
+constexpr int   kPoseStableAgeForSparseInfer = 4;         // 稳态判定帧数
+constexpr float kPoseStableScoreForSparseInfer = 0.74f;   // 稳态判定分数
+constexpr int   kPoseAcquireConfirmFrames = 2;            // 新目标上屏前需要连续确认
+constexpr int   kPoseAcquireClearAfterMissFrames = 1;     // 未上屏候选允许的空帧数
+constexpr int   kPoseHoldFrames = 3;                      // 手势结果短时保持，覆盖分时推理空窗
+constexpr int   kPoseClearAfterMissFrames = 3;            // 连续空帧后清屏
+constexpr float kPoseTrackSmoothAlpha = 0.34f;            // 手势框基础平滑系数
+constexpr float kPoseTrackSmoothAlphaFast = 0.72f;        // 手势快速运动时的跟随系数
+constexpr float kPoseTrackMatchMinIoU = 0.08f;            // 手势跟踪最小IoU
+constexpr float kPoseTrackMaxCenterDistPx = 128.0f;       // 手势跟踪最大中心距离
+constexpr float kPoseAcquireMatchMinIoU = 0.03f;          // 候选确认阶段最小IoU
+constexpr float kPoseAcquireMaxCenterDistPx = 112.0f;     // 候选确认阶段最大中心距离
+constexpr float kPoseClassSwitchMargin = 0.08f;           // 切换类别需要的额外置信优势
+constexpr int   kPoseClassSwitchConfirmFrames = 2;        // 切换类别需要连续确认次数
 
 // ============================================================================
 // Kalman滤波参数（针对CPU高精度亚像素坐标，必须大幅干掉R以消除延迟！）
@@ -234,6 +244,115 @@ struct EyeTrack {
     }
 };
 
+float Clamp01(float value) {
+    return std::max(0.0f, std::min(1.0f, value));
+}
+
+float BoxWidthFast(const std::array<float, 4>& box) {
+    return std::max(0.0f, box[2] - box[0]);
+}
+
+float BoxHeightFast(const std::array<float, 4>& box) {
+    return std::max(0.0f, box[3] - box[1]);
+}
+
+float BoxAreaFast(const std::array<float, 4>& box) {
+    return BoxWidthFast(box) * BoxHeightFast(box);
+}
+
+float BoxCenterXFast(const std::array<float, 4>& box) {
+    return 0.5f * (box[0] + box[2]);
+}
+
+float BoxCenterYFast(const std::array<float, 4>& box) {
+    return 0.5f * (box[1] + box[3]);
+}
+
+float BoxCenterDistanceFast(const std::array<float, 4>& a,
+                            const std::array<float, 4>& b) {
+    const float dx = BoxCenterXFast(a) - BoxCenterXFast(b);
+    const float dy = BoxCenterYFast(a) - BoxCenterYFast(b);
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+float BoxIoUFast(const std::array<float, 4>& a,
+                 const std::array<float, 4>& b) {
+    const float ix1 = std::max(a[0], b[0]);
+    const float iy1 = std::max(a[1], b[1]);
+    const float ix2 = std::min(a[2], b[2]);
+    const float iy2 = std::min(a[3], b[3]);
+    const float inter = std::max(0.0f, ix2 - ix1) * std::max(0.0f, iy2 - iy1);
+    const float uni = BoxAreaFast(a) + BoxAreaFast(b) - inter;
+    if (uni < 1e-6f) {
+        return 0.0f;
+    }
+    return inter / uni;
+}
+
+std::array<float, 4> BlendBoxes(const std::array<float, 4>& prev_box,
+                                const std::array<float, 4>& det_box,
+                                float alpha) {
+    const float a = Clamp01(alpha);
+    std::array<float, 4> out = prev_box;
+    for (int i = 0; i < 4; ++i) {
+        out[i] = (1.0f - a) * prev_box[i] + a * det_box[i];
+    }
+    return out;
+}
+
+bool PoseSpatialMatch(const std::array<float, 4>& ref_box,
+                      const std::array<float, 4>& det_box,
+                      float min_iou,
+                      float max_center_dist_px) {
+    if (BoxIoUFast(ref_box, det_box) >= min_iou) {
+        return true;
+    }
+    return BoxCenterDistanceFast(ref_box, det_box) <= max_center_dist_px;
+}
+
+float PoseCenterPreference(const std::array<float, 4>& box,
+                           float img_w,
+                           float img_h) {
+    const float half_w = std::max(1.0f, img_w * 0.5f);
+    const float half_h = std::max(1.0f, img_h * 0.5f);
+    const float nx = std::fabs(BoxCenterXFast(box) - img_w * 0.5f) / half_w;
+    const float ny = std::fabs(BoxCenterYFast(box) - img_h * 0.5f) / half_h;
+    return Clamp01(1.0f - (0.65f * nx + 0.35f * ny));
+}
+
+float PoseAreaPreference(const std::array<float, 4>& box,
+                         float img_w,
+                         float img_h) {
+    const float img_area = std::max(1.0f, img_w * img_h);
+    const float area_ratio = BoxAreaFast(box) / img_area;
+    const float target_ratio = 0.065f;
+    const float tolerance = 0.065f;
+    return Clamp01(1.0f - std::fabs(area_ratio - target_ratio) / tolerance);
+}
+
+float PoseQualityBias(const std::array<float, 4>& box,
+                      float img_w,
+                      float img_h) {
+    const float center_pref = PoseCenterPreference(box, img_w, img_h);
+    const float area_pref = PoseAreaPreference(box, img_w, img_h);
+    return 0.55f * center_pref + 0.45f * area_pref;
+}
+
+float ComputePoseTrackAlpha(const std::array<float, 4>& prev_box,
+                            const std::array<float, 4>& det_box,
+                            float det_score,
+                            bool same_class) {
+    const float prev_size = std::max(18.0f, std::sqrt(std::max(1.0f, BoxAreaFast(prev_box))));
+    const float motion = Clamp01(BoxCenterDistanceFast(prev_box, det_box) / (0.65f * prev_size + 18.0f));
+    const float confidence = Clamp01((det_score - kPoseDisplayScoreThresholdTracked) / 0.30f);
+    float alpha = kPoseTrackSmoothAlpha +
+                  (kPoseTrackSmoothAlphaFast - kPoseTrackSmoothAlpha) * (0.70f * motion + 0.30f * confidence);
+    if (!same_class) {
+        alpha = std::max(alpha, 0.58f);
+    }
+    return Clamp01(alpha);
+}
+
 struct PoseTrack {
     bool active = false;
     std::array<float, 4> box = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -243,6 +362,21 @@ struct PoseTrack {
     int age = 0;
     int pending_cls = -1;
     int pending_count = 0;
+    bool acquire_active = false;
+    std::array<float, 4> acquire_box = {0.0f, 0.0f, 0.0f, 0.0f};
+    int acquire_cls = -1;
+    float acquire_score = 0.0f;
+    int acquire_hits = 0;
+    int acquire_miss = 0;
+
+    void ResetAcquire() {
+        acquire_active = false;
+        acquire_box = {0.0f, 0.0f, 0.0f, 0.0f};
+        acquire_cls = -1;
+        acquire_score = 0.0f;
+        acquire_hits = 0;
+        acquire_miss = 0;
+    }
 
     void Reset() {
         active = false;
@@ -253,6 +387,15 @@ struct PoseTrack {
         age = 0;
         pending_cls = -1;
         pending_count = 0;
+        ResetAcquire();
+    }
+
+    bool IsStable() const {
+        return active &&
+               age >= kPoseStableAgeForSparseInfer &&
+               score >= kPoseStableScoreForSparseInfer &&
+               pending_count == 0 &&
+               miss == 0;
     }
 
     void Init(const std::array<float, 4>& det_box, int det_cls, float det_score) {
@@ -264,23 +407,81 @@ struct PoseTrack {
         age = 1;
         pending_cls = -1;
         pending_count = 0;
+        ResetAcquire();
     }
 
-    void Update(const std::array<float, 4>& det_box, int det_cls, float det_score) {
-        if (!active) {
+    void NoteMiss() {
+        if (active) {
+            miss += 1;
+            pending_cls = -1;
+            pending_count = 0;
+            return;
+        }
+        if (acquire_active) {
+            acquire_miss += 1;
+            if (acquire_miss > kPoseAcquireClearAfterMissFrames) {
+                ResetAcquire();
+            }
+        }
+    }
+
+    void UpdateAcquire(const std::array<float, 4>& det_box, int det_cls, float det_score) {
+        if (det_score >= kPoseImmediateAcceptScore) {
             Init(det_box, det_cls, det_score);
             return;
         }
 
-        const float a = kPoseTrackSmoothAlpha;
-        for (int i = 0; i < 4; ++i) {
-            box[i] = (1.0f - a) * box[i] + a * det_box[i];
+        if (!acquire_active) {
+            acquire_active = true;
+            acquire_box = det_box;
+            acquire_cls = det_cls;
+            acquire_score = det_score;
+            acquire_hits = 1;
+            acquire_miss = 0;
+            return;
         }
-        score = 0.65f * score + 0.35f * det_score;
+
+        const bool same_cls = (det_cls == acquire_cls);
+        const bool spatial_match = PoseSpatialMatch(acquire_box,
+                                                    det_box,
+                                                    kPoseAcquireMatchMinIoU,
+                                                    kPoseAcquireMaxCenterDistPx);
+        if (same_cls && spatial_match) {
+            acquire_box = BlendBoxes(acquire_box, det_box, 0.45f);
+            acquire_score = std::max(det_score, 0.60f * acquire_score + 0.40f * det_score);
+            acquire_hits += 1;
+            acquire_miss = 0;
+            if (acquire_hits >= kPoseAcquireConfirmFrames) {
+                Init(acquire_box, acquire_cls, acquire_score);
+            }
+            return;
+        }
+
+        const float replace_margin = spatial_match ? 0.10f : 0.04f;
+        if (!same_cls || det_score >= acquire_score + replace_margin) {
+            acquire_box = det_box;
+            acquire_cls = det_cls;
+            acquire_score = det_score;
+            acquire_hits = 1;
+            acquire_miss = 0;
+        }
+    }
+
+    void Update(const std::array<float, 4>& det_box, int det_cls, float det_score) {
+        if (!active) {
+            UpdateAcquire(det_box, det_cls, det_score);
+            return;
+        }
+
+        const float prev_score = score;
+        const bool same_cls = (det_cls == cls);
+        box = BlendBoxes(box, det_box, ComputePoseTrackAlpha(box, det_box, det_score, same_cls));
+        score = same_cls ? (0.55f * score + 0.45f * det_score)
+                         : (0.70f * score + 0.30f * det_score);
         miss = 0;
         age += 1;
 
-        if (det_cls == cls) {
+        if (same_cls) {
             pending_cls = -1;
             pending_count = 0;
             return;
@@ -293,9 +494,10 @@ struct PoseTrack {
             pending_count += 1;
         }
 
-        if (det_score >= score + kPoseClassSwitchMargin ||
+        if (det_score >= std::max(kPoseDisplayScoreThresholdSwitch, prev_score + kPoseClassSwitchMargin) ||
             pending_count >= kPoseClassSwitchConfirmFrames) {
             cls = det_cls;
+            score = std::max(det_score, score);
             pending_cls = -1;
             pending_count = 0;
         }
@@ -312,6 +514,14 @@ std::vector<int> g_last_drawn_classes;
 int g_last_draw_frame = -10000;
 bool g_has_active_overlay = false;
 int g_consecutive_empty_frames = 0;
+
+bool ShouldRunPoseInference(int frame_id, bool has_pose_overlay) {
+    const int phase = frame_id % kPoseInferInterval;
+    if (!has_pose_overlay || !g_pose_track.active) {
+        return phase != 0;
+    }
+    return g_pose_track.IsStable() ? (phase == kPoseInferPhase) : (phase != 0);
+}
 
 // ============================================================================
 // 工具函数
@@ -341,7 +551,9 @@ float CenterDist2(const std::array<float, 4>& a, const std::array<float, 4>& b) 
 
 int SelectPrimaryPoseIndex(const std::vector<std::array<float, 4>>& boxes,
                            const std::vector<int>& class_ids,
-                           const std::vector<float>& scores) {
+                           const std::vector<float>& scores,
+                           float img_w,
+                           float img_h) {
     const size_t n = std::min(boxes.size(), std::min(class_ids.size(), scores.size()));
     if (n == 0) {
         return -1;
@@ -349,8 +561,17 @@ int SelectPrimaryPoseIndex(const std::vector<std::array<float, 4>>& boxes,
 
     int best_idx = -1;
     float best_metric = -std::numeric_limits<float>::infinity();
+    int fallback_idx = -1;
+    float fallback_metric = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < n; ++i) {
-        float metric = scores[i];
+        const float quality_bias = 0.08f * PoseQualityBias(boxes[i], img_w, img_h);
+        const float base_metric = scores[i] + quality_bias;
+        if (base_metric > fallback_metric) {
+            fallback_metric = base_metric;
+            fallback_idx = static_cast<int>(i);
+        }
+
+        float metric = base_metric;
         if (g_pose_track.active) {
             const float iou = ComputeIoU(g_pose_track.box, boxes[i]);
             const float dist2 = CenterDist2(g_pose_track.box, boxes[i]);
@@ -360,8 +581,17 @@ int SelectPrimaryPoseIndex(const std::vector<std::array<float, 4>>& boxes,
             if (iou < kPoseTrackMatchMinIoU && proximity <= 0.0f) {
                 continue;
             }
-            metric += 0.25f * iou + 0.12f * proximity;
+            metric += 0.28f * iou + 0.18f * proximity;
             if (class_ids[i] == g_pose_track.cls) {
+                metric += 0.06f;
+            }
+        } else if (g_pose_track.acquire_active) {
+            const float iou = BoxIoUFast(g_pose_track.acquire_box, boxes[i]);
+            const float dist = BoxCenterDistanceFast(g_pose_track.acquire_box, boxes[i]);
+            const float proximity =
+                std::max(0.0f, 1.0f - dist / std::max(1.0f, kPoseAcquireMaxCenterDistPx));
+            metric += 0.18f * iou + 0.10f * proximity;
+            if (class_ids[i] == g_pose_track.acquire_cls) {
                 metric += 0.05f;
             }
         }
@@ -371,7 +601,13 @@ int SelectPrimaryPoseIndex(const std::vector<std::array<float, 4>>& boxes,
             best_idx = static_cast<int>(i);
         }
     }
-    return best_idx;
+    if (best_idx >= 0) {
+        return best_idx;
+    }
+    if (fallback_idx >= 0 && scores[fallback_idx] >= kPoseImmediateAcceptScore) {
+        return fallback_idx;
+    }
+    return -1;
 }
 
 bool SelectPrimaryFaceRoi(const FaceDetectionResult& face_result,
@@ -891,6 +1127,8 @@ const char* PoseClassName(int class_id) {
 
 void FilterPoseDetectionsForDisplay(const FaceDetectionResult& result,
                                     float score_threshold,
+                                    float img_w,
+                                    float img_h,
                                     std::vector<std::array<float, 4>>* boxes_out,
                                     std::vector<int>* class_ids_out,
                                     std::vector<float>* scores_out) {
@@ -904,7 +1142,35 @@ void FilterPoseDetectionsForDisplay(const FaceDetectionResult& result,
     class_ids_out->reserve(n);
     scores_out->reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        if (result.scores[i] < score_threshold) {
+        float dynamic_threshold = score_threshold;
+        if (g_pose_track.active) {
+            const bool same_cls = (result.class_ids[i] == g_pose_track.cls);
+            const bool spatial_match = PoseSpatialMatch(g_pose_track.box,
+                                                        result.boxes[i],
+                                                        kPoseTrackMatchMinIoU,
+                                                        kPoseTrackMaxCenterDistPx);
+            if (same_cls && spatial_match) {
+                dynamic_threshold = kPoseDisplayScoreThresholdTracked;
+            } else if (spatial_match) {
+                dynamic_threshold = kPoseDisplayScoreThresholdSwitch;
+            } else {
+                dynamic_threshold = std::max(dynamic_threshold, kPoseDisplayScoreThresholdSwitch);
+            }
+        } else if (g_pose_track.acquire_active) {
+            const bool same_cls = (result.class_ids[i] == g_pose_track.acquire_cls);
+            const bool spatial_match = PoseSpatialMatch(g_pose_track.acquire_box,
+                                                        result.boxes[i],
+                                                        kPoseAcquireMatchMinIoU,
+                                                        kPoseAcquireMaxCenterDistPx);
+            if (same_cls && spatial_match) {
+                dynamic_threshold = std::max(kPoseDisplayScoreThresholdTracked,
+                                             score_threshold - 0.04f);
+            }
+        }
+
+        const float quality_assisted_score =
+            result.scores[i] + 0.06f * PoseQualityBias(result.boxes[i], img_w, img_h);
+        if (quality_assisted_score < dynamic_threshold) {
             continue;
         }
         boxes_out->push_back(result.boxes[i]);
@@ -1037,8 +1303,6 @@ void inference_thread_func(POSEDETGRAY* pose_detector,
 
         const uint8_t* y_plane = reinterpret_cast<const uint8_t*>(get_data(img_pair.img1));
         const int face_infer_phase = img_pair.frame_id % kFaceInferInterval;
-        const int pose_infer_phase = img_pair.frame_id % kPoseInferInterval;
-
         // 人脸低频检测：phase 0
         if (face_detector != nullptr &&
             (face_infer_phase == 0 || !has_face_roi)) {
@@ -1073,35 +1337,48 @@ void inference_thread_func(POSEDETGRAY* pose_detector,
 
         // pose/手势低频检测：phase 1，与 face 交错
         if (pose_detector != nullptr &&
-            (pose_infer_phase == kPoseInferPhase || !has_pose_overlay)) {
+            ShouldRunPoseInference(img_pair.frame_id, has_pose_overlay)) {
             pose_detector->Predict(&img_pair.img2, pose_result, kPoseInferConfThreshold);
             std::vector<std::array<float, 4>> pose_display_boxes;
             std::vector<int> pose_display_classes;
             std::vector<float> pose_display_scores;
             FilterPoseDetectionsForDisplay(*pose_result,
                                            kPoseDisplayScoreThreshold,
+                                           static_cast<float>(img_width),
+                                           static_cast<float>(img_height),
                                            &pose_display_boxes,
                                            &pose_display_classes,
                                            &pose_display_scores);
+            bool pose_updated = false;
             if (!pose_display_boxes.empty()) {
                 const int best_idx = SelectPrimaryPoseIndex(
-                    pose_display_boxes, pose_display_classes, pose_display_scores);
+                    pose_display_boxes,
+                    pose_display_classes,
+                    pose_display_scores,
+                    static_cast<float>(img_width),
+                    static_cast<float>(img_height));
                 if (best_idx >= 0) {
                     g_pose_track.Update(pose_display_boxes[best_idx],
                                         pose_display_classes[best_idx],
                                         pose_display_scores[best_idx]);
+                    pose_updated = true;
                     has_pose_overlay = g_pose_track.active;
-                    pose_miss_frames = 0;
-
-                    std::vector<int> stable_classes(1, g_pose_track.cls);
-                    std::vector<float> stable_scores(1, g_pose_track.score);
-                    PrintPoseSummary(stable_classes, stable_scores, img_pair.frame_id);
+                    if (has_pose_overlay) {
+                        pose_miss_frames = 0;
+                        std::vector<int> stable_classes(1, g_pose_track.cls);
+                        std::vector<float> stable_scores(1, g_pose_track.score);
+                        PrintPoseSummary(stable_classes, stable_scores, img_pair.frame_id);
+                    }
                 }
-            } else if (has_pose_overlay) {
-                pose_miss_frames += 1;
-                if (pose_miss_frames > kPoseHoldFrames) {
-                    g_pose_track.Reset();
-                    has_pose_overlay = false;
+            }
+            if (!pose_updated) {
+                g_pose_track.NoteMiss();
+                if (has_pose_overlay) {
+                    pose_miss_frames += 1;
+                    if (pose_miss_frames > kPoseHoldFrames) {
+                        g_pose_track.Reset();
+                        has_pose_overlay = false;
+                    }
                 }
             }
         }
@@ -1180,7 +1457,14 @@ int main(int argc, char* argv[]) {
     g_eye_draw_mode = 0;
     printf("[INFO] Eye draw mode: circle (forced)\n");
     printf("[INFO] Pose class colors: up->1 ok->2 down->3\n");
-    printf("[INFO] Pose display threshold: %.2f\n", kPoseDisplayScoreThreshold);
+    printf("[INFO] Pose thresholds: acquire=%.2f tracked=%.2f switch=%.2f immediate=%.2f\n",
+           kPoseDisplayScoreThreshold,
+           kPoseDisplayScoreThresholdTracked,
+           kPoseDisplayScoreThresholdSwitch,
+           kPoseImmediateAcceptScore);
+    printf("[INFO] Pose infer schedule: fast=2/3 stable=1/3 acquire_confirm=%d hold=%d\n",
+           kPoseAcquireConfirmFrames,
+           kPoseHoldFrames);
     
     if (ssne_initial()) {
         fprintf(stderr, "SSNE initialization failed!\n");

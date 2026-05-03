@@ -18,11 +18,24 @@ constexpr int kPoseDebugPredictPrintCount = 5;
 constexpr float kPoseClassMargin = 0.08f;
 constexpr float kPoseCrossClassSuppressIoU = 0.60f;
 constexpr float kPoseMaxBoxAreaRatio = 0.45f;
+constexpr float kPoseMinAspectRatio = 0.30f;
+constexpr float kPoseMaxAspectRatio = 2.80f;
+constexpr float kPosePreferredAspectMin = 0.55f;
+constexpr float kPosePreferredAspectMax = 1.85f;
+constexpr float kPoseAreaRejectLowRatio = 0.0035f;
+constexpr float kPoseAreaRejectHighRatio = 0.42f;
+constexpr float kPoseAreaPreferredLowRatio = 0.015f;
+constexpr float kPoseAreaPreferredHighRatio = 0.20f;
+constexpr float kPoseEdgeMarginRatio = 0.08f;
+constexpr float kPoseGeometryRejectThreshold = 0.12f;
+constexpr float kPoseLowScoreGeometryGate = 0.36f;
 
 struct PoseCandidate {
     std::array<float, 4> box;
     float score = 0.0f;
     int cls = -1;
+    float quality = 0.0f;
+    float metric = 0.0f;
 };
 
 float Sigmoid(float x) {
@@ -41,6 +54,76 @@ float BoxHeight(const std::array<float, 4>& box) {
 
 float BoxArea(const std::array<float, 4>& box) {
     return BoxWidth(box) * BoxHeight(box);
+}
+
+float Clamp01(float v) {
+    return std::max(0.0f, std::min(1.0f, v));
+}
+
+float CenterX(const std::array<float, 4>& box) {
+    return 0.5f * (box[0] + box[2]);
+}
+
+float CenterY(const std::array<float, 4>& box) {
+    return 0.5f * (box[1] + box[3]);
+}
+
+float RangeQuality(float value,
+                   float reject_low,
+                   float preferred_low,
+                   float preferred_high,
+                   float reject_high) {
+    if (value <= reject_low || value >= reject_high) {
+        return 0.0f;
+    }
+    if (value >= preferred_low && value <= preferred_high) {
+        return 1.0f;
+    }
+    if (value < preferred_low) {
+        return Clamp01((value - reject_low) / std::max(1e-6f, preferred_low - reject_low));
+    }
+    return Clamp01((reject_high - value) / std::max(1e-6f, reject_high - preferred_high));
+}
+
+float ComputePoseGeometryQuality(const std::array<float, 4>& box,
+                                 int det_w,
+                                 int det_h) {
+    const float w = BoxWidth(box);
+    const float h = BoxHeight(box);
+    if (w < 1.0f || h < 1.0f) {
+        return 0.0f;
+    }
+
+    const float aspect = w / h;
+    const float area_ratio = BoxArea(box) / std::max(1.0f, static_cast<float>(det_w * det_h));
+    const float cx = CenterX(box);
+    const float cy = CenterY(box);
+    const float nx = std::fabs(cx - det_w * 0.5f) / std::max(1.0f, det_w * 0.5f);
+    const float ny = std::fabs(cy - det_h * 0.5f) / std::max(1.0f, det_h * 0.5f);
+    const float center_quality = Clamp01(1.0f - (0.60f * nx + 0.40f * ny));
+
+    const float edge_margin_x = det_w * kPoseEdgeMarginRatio;
+    const float edge_margin_y = det_h * kPoseEdgeMarginRatio;
+    const float edge_dx = std::min(box[0], std::max(0.0f, static_cast<float>(det_w) - box[2]));
+    const float edge_dy = std::min(box[1], std::max(0.0f, static_cast<float>(det_h) - box[3]));
+    const float edge_quality_x = Clamp01(edge_dx / std::max(1.0f, edge_margin_x));
+    const float edge_quality_y = Clamp01(edge_dy / std::max(1.0f, edge_margin_y));
+    const float edge_quality = 0.5f * edge_quality_x + 0.5f * edge_quality_y;
+
+    const float area_quality = RangeQuality(area_ratio,
+                                            kPoseAreaRejectLowRatio,
+                                            kPoseAreaPreferredLowRatio,
+                                            kPoseAreaPreferredHighRatio,
+                                            kPoseAreaRejectHighRatio);
+    const float aspect_quality = RangeQuality(aspect,
+                                              kPoseMinAspectRatio,
+                                              kPosePreferredAspectMin,
+                                              kPosePreferredAspectMax,
+                                              kPoseMaxAspectRatio);
+    return 0.34f * area_quality +
+           0.28f * aspect_quality +
+           0.20f * center_quality +
+           0.18f * edge_quality;
 }
 
 float IoU(const std::array<float, 4>& a, const std::array<float, 4>& b) {
@@ -100,29 +183,45 @@ struct WBFCluster {
     float x2 = 0.0f;
     float y2 = 0.0f;
     float total_score = 0.0f;
+    float total_weight = 0.0f;
+    float total_quality = 0.0f;
+    float best_score = 0.0f;
     int count = 0;
 
     void Add(const PoseCandidate& det) {
-        x1 += det.box[0] * det.score;
-        y1 += det.box[1] * det.score;
-        x2 += det.box[2] * det.score;
-        y2 += det.box[3] * det.score;
+        const float weight = std::max(1e-4f, det.metric);
+        x1 += det.box[0] * weight;
+        y1 += det.box[1] * weight;
+        x2 += det.box[2] * weight;
+        y2 += det.box[3] * weight;
         total_score += det.score;
+        total_weight += weight;
+        total_quality += det.quality;
+        best_score = std::max(best_score, det.score);
         count += 1;
         cls = det.cls;
     }
 
     std::array<float, 4> GetBox() const {
-        if (total_score < 1e-6f) return {0.0f, 0.0f, 0.0f, 0.0f};
-        const float inv = 1.0f / total_score;
+        if (total_weight < 1e-6f) return {0.0f, 0.0f, 0.0f, 0.0f};
+        const float inv = 1.0f / total_weight;
         return {x1 * inv, y1 * inv, x2 * inv, y2 * inv};
     }
 
     float GetScore() const {
         if (count <= 0) return 0.0f;
         const float avg = total_score / static_cast<float>(count);
-        const float multi_bonus = std::min(0.12f, 0.04f * static_cast<float>(count - 1));
-        return std::min(1.0f, avg + multi_bonus);
+        const float quality = total_quality / static_cast<float>(count);
+        const float multi_bonus = std::min(0.10f, 0.03f * static_cast<float>(count - 1));
+        const float quality_bonus = 0.05f * Clamp01((quality - 0.45f) / 0.55f);
+        return std::min(1.0f, 0.72f * best_score + 0.28f * avg + multi_bonus + quality_bonus);
+    }
+
+    float GetQuality() const {
+        if (count <= 0) {
+            return 0.0f;
+        }
+        return total_quality / static_cast<float>(count);
     }
 };
 
@@ -137,7 +236,7 @@ void WeightedBoxFusionByClass(const std::vector<PoseCandidate>& in,
     for (auto& kv : grouped) {
         auto& dets = kv.second;
         std::sort(dets.begin(), dets.end(), [](const PoseCandidate& lhs, const PoseCandidate& rhs) {
-            return lhs.score > rhs.score;
+            return lhs.metric > rhs.metric;
         });
 
         std::vector<WBFCluster> clusters;
@@ -162,6 +261,8 @@ void WeightedBoxFusionByClass(const std::vector<PoseCandidate>& in,
             fused.box = cluster.GetBox();
             fused.score = cluster.GetScore();
             fused.cls = cluster.cls;
+            fused.quality = cluster.GetQuality();
+            fused.metric = fused.score + 0.10f * fused.quality;
             out->push_back(fused);
         }
     }
@@ -174,7 +275,7 @@ void SuppressOverlapsClassAgnostic(std::vector<PoseCandidate>* dets,
     }
 
     std::sort(dets->begin(), dets->end(), [](const PoseCandidate& lhs, const PoseCandidate& rhs) {
-        return lhs.score > rhs.score;
+        return lhs.metric > rhs.metric;
     });
 
     std::vector<PoseCandidate> kept;
@@ -320,10 +421,19 @@ void POSEDETGRAY::Postprocess(FaceDetectionResult* result, float* conf_threshold
         if (result->scores[i] < *conf_threshold) continue;
         if (BoxWidth(box) < min_box_size || BoxHeight(box) < min_box_size) continue;
         if (BoxArea(box) > max_box_area) continue;
+        const float quality = ComputePoseGeometryQuality(box, det_shape[0], det_shape[1]);
+        if (quality < kPoseGeometryRejectThreshold) continue;
+        const float assisted_score = result->scores[i] + 0.10f * quality;
+        if (result->scores[i] < (*conf_threshold + 0.04f) && quality < kPoseLowScoreGeometryGate) {
+            continue;
+        }
+
         PoseCandidate det;
         det.box = box;
         det.score = result->scores[i];
         det.cls = result->class_ids[i];
+        det.quality = quality;
+        det.metric = assisted_score;
         candidates.push_back(det);
     }
     if (candidates.empty()) {
@@ -332,7 +442,7 @@ void POSEDETGRAY::Postprocess(FaceDetectionResult* result, float* conf_threshold
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const PoseCandidate& lhs, const PoseCandidate& rhs) {
-        return lhs.score > rhs.score;
+        return lhs.metric > rhs.metric;
     });
     if (static_cast<int>(candidates.size()) > top_k) {
         candidates.resize(top_k);
@@ -343,7 +453,7 @@ void POSEDETGRAY::Postprocess(FaceDetectionResult* result, float* conf_threshold
     WeightedBoxFusionByClass(candidates, nms_threshold, &fused);
     SuppressOverlapsClassAgnostic(&fused, kPoseCrossClassSuppressIoU);
     std::sort(fused.begin(), fused.end(), [](const PoseCandidate& lhs, const PoseCandidate& rhs) {
-        return lhs.score > rhs.score;
+        return lhs.metric > rhs.metric;
     });
     if (static_cast<int>(fused.size()) > keep_top_k) {
         fused.resize(keep_top_k);
