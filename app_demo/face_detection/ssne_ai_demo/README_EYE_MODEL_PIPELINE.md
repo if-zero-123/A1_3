@@ -1,299 +1,501 @@
-# A1 眼睛模型部署与运行全流程说明（含输入/接口/输出/后处理/OSD）
+# A1 眼动 / 手势 demo 说明
 
-本文档基于当前工程代码整理，目标是把你这套「脸+眼」链路从部署到显示完整讲清楚。
+这份说明只讲当前这套 `ssne_ai_demo` 实际在做什么，方便后面继续改代码或者联调上位机。
 
 适用目录：
 
 - `smart_software/src/app_demo/face_detection/ssne_ai_demo/`
 
-核心源码：
+主要文件：
 
 - 主流程：`demo_face.cpp`
 - 图像输入：`src/pipeline_image.cpp`
-- 眼睛模型：`src/eye_det_gray.cpp`
-- 人脸模型：`src/scrfd_gray.cpp`
-- OSD 可视化：`src/utils.cpp`
-- 数据结构定义：`include/common.hpp`
-- OSD 设备实现：`src/osd-device.cpp`, `include/osd-device.hpp`
+- 眼睛检测：`src/eye_det_gray.cpp`
+- 人脸检测：`src/scrfd_gray.cpp`
+- 手势检测：`src/pose_det_gray.cpp`
+- OSD：`src/utils.cpp`
+- OSD 设备：`src/osd-device.cpp`
+- 公共结构：`include/common.hpp`
+- 运行脚本：`scripts/run.sh`
 
 ---
 
-## 1. 你现在这套系统在做什么（总览）
+## 1. 当前功能概览
 
-运行时是双线程结构：
+程序现在有三条识别链路：
 
-1. **主线程（采图 + ISP显示）**
-   - 从在线 pipeline 拉取双路图像（`GetDualImageData`）
-   - 把图像送 ISP debug load
-   - 把最新一帧放入推理队列（队列长度=1，旧帧会被丢弃）
+1. 人脸检测
+2. 眼睛检测 + 跟踪稳定
+3. 手势检测
 
-2. **推理线程（脸+眼）**
-   - 低频做人脸（每 `kFaceInferInterval=3` 帧）
-   - 每帧做眼睛推理
-   - 对眼睛检测结果做卡尔曼稳定
-   - 转换成固定半径“眼点框”
-   - OSD 绘制：脸框 + 眼点（强制 circle 模式）
+另外还多了一条串口遥测链路：
 
----
+- 通过 UART 发眼动位置和手势识别结果给上位机
 
-## 2. 模型部署到程序里的入口与接口
+运行时是双线程：
 
-### 2.1 模型路径与输入尺寸
+- 主线程负责取图、ISP debug load、把最新帧塞进队列
+- 推理线程负责人脸 / 眼睛 / 手势推理、OSD 绘制、串口发包
 
-在 `demo_face.cpp`：
-
-- 眼睛模型路径：`/app_demo/app_assets/models/eye.m1model`
-- 人脸模型路径：`/app_demo/app_assets/models/face_640x480.m1model`
-- 两个模型输入尺寸都配置为 `640x480`
-
-### 2.2 类接口（来自 `include/common.hpp`）
-
-#### 眼睛模型接口：`EYEDETGRAY`
-
-- 初始化：
-  - `Initialize(std::string& model_path, std::array<int,2>* in_img_shape, std::array<int,2>* in_det_shape, int in_box_len)`
-- 推理：
-  - `Predict(ssne_tensor_t* img_in, FaceDetectionResult* result, float conf_threshold=0.25f)`
-- 释放：
-  - `Release()`
-
-#### 人脸模型接口：`SCRFDGRAY`
-
-- 初始化：
-  - `Initialize(...)`
-- 推理：
-  - `Predict(...)`
-- 释放：
-  - `Release()`
-
-#### 通用结果结构：`FaceDetectionResult`
-
-- `boxes: vector<array<float,4>>`（每个框 `[x1,y1,x2,y2]`）
-- `scores: vector<float>`（置信度）
-- `landmarks`（人脸关键点可选）
+队列长度固定是 `1`，旧帧会直接丢掉，目的是优先保实时性。
 
 ---
 
-## 3. 输入数据是什么？从哪来？是什么格式？
+## 2. 图像输入
 
-### 3.1 图像来源
+图像输入在 `src/pipeline_image.cpp`。
 
-`src/pipeline_image.cpp`：
+当前配置：
 
-- `OnlineSetOutputImage(kPipeline0, SSNE_Y_8, 640, 480)`
-- `GetDualImageData(...)` 获取双路图（灰度）
+- 图像格式：`SSNE_Y_8`
+- 输出尺寸：`640 x 480`
+- 接口：`GetDualImageData(...)`
 
-所以输入给模型前的源数据是：
+也就是说，后面的眼睛、人脸、手势三路模型，拿到的都是双路灰度图。
 
-- **格式**：`SSNE_Y_8`（8-bit 单通道灰度）
-- **尺寸**：640x480
-- **容器类型**：`ssne_tensor_t`
+主线程每轮做的事情基本是：
 
-### 3.2 推理前预处理接口
-
-眼睛/人脸模型都走：
-
-- `RunAiPreprocessPipe(pipe_offline, *img_in, inputs[0])`
-
-这是 SDK 的离线前处理流水线，负责把在线图转成模型输入张量（尺寸/数据类型/归一化等按模型配置执行）。
+1. `processor.GetDualImage(&img_sensor[0], &img_sensor[1])`
+2. 把两路图拷到 `output_sensor`
+3. `start_isp_debug_load()`
+4. 把当前帧塞进推理队列
 
 ---
 
-## 4. 推理完成后获得什么数据？有哪些输出？
+## 3. 模型与输入尺寸
 
-## 4.1 眼睛模型输出（`eye_det_gray.cpp`）
+在 `demo_face.cpp` 里当前用到这几个模型：
 
-调用：
+- 眼睛模型：`/app_demo/app_assets/models/eye.m1model`
+- 手势模型：`/app_demo/app_assets/models/pose.m1model`
+- 人脸模型：`/app_demo/app_assets/models/face_640x480.m1model`
 
-- `ssne_getoutput(model_id, 6, outputs)`
+输入尺寸都按 `640 x 480` 初始化。
 
-即：**6 个输出头**（YOLOv8 风格三尺度，分类3个 + 回归3个）。
+### 相关类
 
-当前代码按 `get_total_size()` 动态识别每个输出头归属：
+- 眼睛：`EYEDETGRAY`
+- 手势：`POSEDETGRAY`
+- 人脸：`SCRFDGRAY`
 
-- 分类头元素数：
-  - S8: `80*60*1 = 4800`
-  - S16: `40*30*1 = 1200`
-  - S32: `20*15*1 = 300`
-- 回归头元素数（DFL，64通道）：
-  - S8: `80*60*64 = 307200`
-  - S16: `40*30*64 = 76800`
-  - S32: `20*15*64 = 19200`
+统一输出结构体：
 
-> 关键注意：在此 SDK 上，`get_total_size()` 返回的是**元素个数**，不是字节数。
-
-## 4.2 人脸模型输出（`scrfd_gray.cpp`）
-
-也是 `ssne_getoutput(..., 6, outputs)`，按固定顺序读取：
-
-- `outputs[0..2]` 分数
-- `outputs[3..5]` 框
+- `FaceDetectionResult`
+  - `boxes`
+  - `scores`
+  - `class_ids`
+  - `landmarks`（人脸路径可用）
 
 ---
 
-## 5. 推理后处理怎么做的？
+## 4. 推理与后处理
 
-## 5.1 眼睛后处理（`eye_det_gray.cpp`）
+### 4.1 人脸
 
-### 第一步：Decode（YOLOv8 + DFL）
+人脸使用 `SCRFDGRAY`。
 
-在 `DecodeBranch`：
+人脸这一路的后处理可以拆成两段看：
 
-- 分类得分：`score = sigmoid(cls_head[idx])`
-- 回归使用 DFL：每个边界（l/t/r/b）从 16-bin 分布做 softmax 加权求期望
-- 由网格中心 `(x+0.5, y+0.5)*stride` + `l/t/r/b` 解码出 `x1,y1,x2,y2`
+#### 单帧后处理（`src/scrfd_gray.cpp`）
 
-### 第二步：筛选 + NMS
+1. 根据 anchor 解码出检测框
+2. 按置信度阈值过滤低分框
+3. 做 NMS 去重
+4. 把检测框从模型输入尺度恢复到原图尺度
 
-- 置信度阈值过滤
-- 按分数排序
-- IoU NMS（`nms_threshold=0.25`）
-- 小框过滤（`min_box_size`）
-- 可选双眼配对筛选（当前 `eye_pair_only=false`）
+这里的输出是一个普通的人脸框列表，结构还是 `FaceDetectionResult`。
 
-### 第三步：尺度恢复 + 几何微调
+#### 时序后处理（`demo_face.cpp`）
 
-- 由模型输入尺度映射回原图尺度（`w_scale/h_scale`）
-- 再做 `ShrinkBoxAroundCenter`（宽高收缩 + 中心上移）
+主流程里没有直接把每一帧人脸框都拿来用，而是只取“当前主人脸 ROI”：
 
-最后输出到 `FaceDetectionResult`：
+1. 从这一帧人脸结果里选最高分框
+2. 记成 `last_face_roi`
+3. 后续几帧如果没检出，也暂时保留这个 ROI
+4. 保留超时后，再认为人脸丢失
 
-- `result->boxes`
-- `result->scores`
+这样做的目的不是让人脸框更稳，而是给眼睛路径提供一个比较稳定的约束区域。
 
-## 5.2 稳定跟踪（`demo_face.cpp`）
+当前策略不是每帧跑，而是自适应降频：
 
-`GetStableEyeBoxes` 使用 2 组卡尔曼（左右眼）对中心和宽高做平滑：
+- 丢失 ROI 或刚进入：`kFaceInferIntervalFast = 2`
+- ROI 稳定后：`kFaceInferIntervalStable = 6`
 
-- 状态：`x, v`（位置+速度）
-- 对象：`cx, cy, w, h`
-- 参数（当前版本）：
-  - `kKalmanQPos=16`
-  - `kKalmanQVel=4`
-  - `kKalmanR=4`
+作用：
 
-并带短时丢检保持：
+- 有脸时尽量省一点算力
+- 丢脸时尽快恢复 ROI
 
-- `kEyeHoldFrames=1`
-- `kClearAfterMissFrames=2`
+### 4.2 眼睛
+
+眼睛检测在 `src/eye_det_gray.cpp`。
+
+当前后处理特征：
+
+- 6 个输出头
+- DFL 解码
+- WBF 融合
+- 小框过滤
+- 眼睛配对筛选
+
+可以分成两层看：
+
+#### 单帧后处理（`src/eye_det_gray.cpp`）
+
+1. 三个尺度头分别做 DFL 解码
+2. 按分数收集候选框
+3. 做 WBF 融合，减少同一只眼多框抖动
+4. 过滤小框
+5. 做双眼配对筛选，只保留更像“一对眼睛”的候选
+
+这一步结束以后，得到的是单帧意义下相对干净的眼睛检测框。
+
+检测后不是直接拿来画，而是在 `demo_face.cpp` 里继续做：
+
+- 人脸 ROI 约束
+- CPU 瞳孔暗斑精定位
+- 卡尔曼跟踪
+- 显示层平滑
+
+#### 时序后处理（`demo_face.cpp`）
+
+这一层才是眼动观感的关键，主要做了下面几件事：
+
+1. **人脸 ROI 约束**
+   - 先用人脸 ROI 把明显不在眼区的候选框筛掉
+   - 这样能减少误检点跑到脸外面
+
+2. **CPU 瞳孔暗斑精定位**
+   - 在眼框内部再找一遍更暗的区域
+   - 把检测框中心往更接近瞳孔的位置拉
+   - 如果暗斑质量不够或者位移太离谱，就放弃这一步
+
+3. **左右眼匹配**
+   - 不是简单按分数，而是按 IoU、中心距离、面积比例和左右半区去匹配
+   - 这一步主要是解决左右眼串位和跳眼问题
+
+4. **卡尔曼跟踪**
+   - 对 `cx / cy / w / h` 分别做滤波
+   - 小抖动压掉，真实运动尽量跟上
+
+5. **显示层平滑**
+   - 画到屏幕前再做一层轻量平滑
+   - 目的是把肉眼最容易看到的 1px 级别抖动再压一遍
+
+6. **稳态隔帧检测**
+   - 眼睛稳定时，不一定每帧都重新跑模型
+   - 中间帧直接走跟踪预测，换一点帧率
+
+当前为了提帧，眼睛也不是永远每帧跑：
+
+- 稳定时：`kEyeInferIntervalStable = 2`
+- 如果运动速度起来了，再恢复每帧检测
+
+### 4.3 手势
+
+手势检测在 `src/pose_det_gray.cpp`。
+
+当前有这些特点：
+
+- 三分类：`up / ok / down`
+- 单帧后处理里带几何质量评分
+- 时序跟踪里有候选确认、切类门槛、类别保持
+- `ok` 类别有额外偏置
+
+同样可以分成两层：
+
+#### 单帧后处理（`src/pose_det_gray.cpp`）
+
+1. 三个尺度头分别解码
+2. 每个候选先做类别置信选择
+3. 过滤掉太小、太大、比例异常、边缘质量差的框
+4. 做按类别的 WBF
+5. 再做一次跨类别重叠抑制
+6. 按质量分和分数排序，保留最终候选
+
+这里的重点是：手势这一路不是只看原始分类分数，还会结合几何质量一起决定是否保留。
+
+#### 时序后处理（`demo_face.cpp`）
+
+手势的时序状态机比脸和眼都复杂，主要做了：
+
+1. **候选确认**
+   - 新目标不会单帧直接上屏
+   - 需要连续确认，避免误触发
+
+2. **跟踪保持**
+   - 已锁定目标后，短时间丢检也不会马上清掉
+   - 框位置做平滑，类别做保持
+
+3. **切类门槛**
+   - 从一个手势切到另一个手势，需要更高分或者连续多帧确认
+   - 这样能减少 `up / ok / down` 来回跳
+
+4. **`ok` 偏置**
+   - `ok` 类别在选择和切换上做了额外偏置
+   - 这是为了让当前演示更容易稳定识别 `ok`
+
+5. **稳态降频**
+   - 手势稳定后，pose 模型不会每帧都跑
+   - 这样能给帧率留一点空间
+
+串口日志当前只保留 `ok` 的识别打印。
 
 ---
 
-## 6. OSD 绘制依据是什么？怎么画出来？
+## 5. 眼动稳定策略
 
-## 6.1 绘制输入数据来源
+眼动稳定逻辑主要在 `demo_face.cpp` 的 `EyeTrack` 和 `GetStableEyeBoxes(...)`。
 
-推理线程每帧得到：
+现在实际是多层叠加：
 
-- 脸框（可选）`last_face_roi`
-- 稳定眼框 `stable_boxes`
+1. 眼睛检测框筛选
+2. 人脸 ROI 约束
+3. CPU 瞳孔精定位
+4. 左右眼匹配
+5. 卡尔曼跟踪
+6. 输出层平滑
 
-然后将稳定眼框转换为**固定半径眼点框**（`BuildEyeDotBox`）：
+### 左右眼匹配
 
-- 中心 = 稳定框中心
-- 半径 = `kEyeDotFixedRadius`（当前12像素）
-- 得到 `eye_dot_boxes`
+不是简单按分数，而是结合：
 
-## 6.2 绘制接口
+- IoU
+- 中心距离
+- 面积比例
+- 左右半区偏置
 
-### 脸框
+左眼这边额外给了一点稳定偏置，主要是为了减少串眼和跳框。
 
-- `g_visualizer->Draw(face_draw)`
-- 在 `utils.cpp` 里，使用空心矩形 `TYPE_HOLLOW`
+### CPU 瞳孔精定位
 
-### 眼点（当前强制 circle）
+当前是从眼框内部找暗斑中心。
 
-- `g_visualizer->DrawCircles(eye_draw)`
+主要限制：
 
-`DrawCircles` 当前实现是：
+- ROI 太小直接跳过
+- 低置信度暗斑不采纳
+- 超过最大位移不采纳
+- 最后跟原始框中心做混合
 
-- **每只眼一个 `TYPE_SOLID` 实心四边形**（不是多点拼圆）
-- 这样是为规避 OSD `ret=-1`（对象过多/约束超限）问题
+### 卡尔曼参数
 
-## 6.3 为什么之前“圆块方案”失败？
+当前版本偏“跟手优先”：
 
-从 OSD 头文件可知（`osd_lib_api.h`）：
+- `kKalmanQPos = 3.2`
+- `kKalmanQVel = 0.9`
+- `kKalmanRCalm = 3.2`
+- `kKalmanRActive = 0.22`
+- `kResidualThresh = 1.8`
 
-- OSD 是 quadrangle 引擎
-- 每层每行凸四边形数量有约束
-
-之前用很多小块拼“圆环”，每帧会提交大量小四边形，容易触发：
-
-- `osd_add_quad_rangle_layer ret = -1`
-
-所以当前改成每眼 1 个实心块，是更稳的落地方案。
-
----
-
-## 7. 当前实时策略（帧率/延迟）
-
-### 7.1 降延迟
-
-- 队列长度 `MAX_QUEUE_SIZE=1`
-- 队列满时丢弃旧帧，永远保留最新帧
-
-### 7.2 分时推理
-
-- 人脸每 3 帧一次（`kFaceInferInterval=3`）
-- 眼睛每帧推理
-
-### 7.3 调试日志开关
-
-`eye_det_gray.cpp`:
-
-- `kEyeVerboseTensorDebug=false`
-
-关闭后可大幅减轻串口/控制台 IO 对帧率影响。
+如果后面要继续调眼动，通常就从这里和 `kEyeOutput...` 这一组开始。
 
 ---
 
-## 8. 部署模型到板端的标准步骤（工程侧）
+## 6. OSD 绘制
 
-> 注：以下是工程接入流程，模型转换命令以你本地 A1-AI-Tool 实际版本为准。
+OSD 绘制在 `src/utils.cpp`，底层设备在 `src/osd-device.cpp`。
 
-1. 训练并导出 ONNX（灰度单通道眼睛模型）
-2. 使用 A1 工具链转换为 `eye.m1model`
-3. 拷贝到板端：
-   - `/app_demo/app_assets/models/eye.m1model`
-4. 编译 demo：
-   - 重新编译 `ssne_ai_demo`
-5. 运行 demo，观察：
-   - 眼点是否稳定显示
-   - 串口是否存在 `ret=-1`
+当前分层大致是：
 
----
+- 脸框 / 手势框：画空心框
+- 眼点：画实心块
 
-## 9. 你最关心的“数据流一句话版”
+眼点没有画真正的圆，而是用一个小的 `TYPE_SOLID` 实心框当作代理点。
 
-`Sensor灰度帧(ssne_tensor_t)`
-→ `RunAiPreprocessPipe`
-→ `ssne_inference`
-→ `ssne_getoutput(6头)`
-→ `DFL解码 + 置信度过滤 + NMS + 尺度恢复`
-→ `卡尔曼稳定`
-→ `固定半径眼点框`
-→ `OSD Draw(脸框) + DrawCircles(眼点)`
+这么做的原因很实际：
 
----
+- OSD quadrangle 引擎有数量限制
+- 用很多小块拼圆容易 `ret=-1`
+- 实心小块稳定得多
 
-## 10. 建议的现场调参顺序（避免反复试错）
+### 当前闪烁控制
 
-1. **先稳显示**：确认没有 `ret=-1`
-2. **调眼点大小**：`kEyeDotFixedRadius`（推荐 9~12）
-3. **调跟随灵敏度**：`kKalmanQPos/QVel/R`
-4. **调丢检观感**：`kEyeHoldFrames` 与 `kClearAfterMissFrames`
-5. **再调检测阈值**：`kEyeInferConfThreshold` / `kEyeDisplayScoreThreshold`
+`demo_face.cpp` 里有几层抑制：
+
+- `kRedrawMinDelta = 3.2`
+- `kOsdMinRedrawFrameGap = 3`
+- `kClearAfterMissFrames = 5`
+
+也就是说，不是每一帧都刷，只在变化够明显或者该清层时才刷。
 
 ---
 
-## 11. 本文档对应当前代码状态说明
+## 7. UART 遥测
 
-本文档描述的是当前分支下已改动后的实现（包括：
+这是当前版本和早期版本差异最大的一块。
 
-- 眼模型 `get_total_size` 按元素匹配
-- 固定半径眼点
-- 强制 circle 模式
-- 低延迟队列策略
-- OSD circle 走实心块代理方案）
+### 7.1 工程接入
 
-如果后续你改了参数或切回 box 模式，请同步更新本 README 的参数表。
+需要的东西已经接到工程里了：
+
+- 头文件：`uart_api.h`
+- 链接库：`libuart.so`
+- 运行脚本会尝试：
+  - `insmod /lib/modules/$(uname -r)/extra/uart_kmod.ko`
+
+### 7.2 初始化
+
+`main()` 里会在 `ssne_initial()` 后做：
+
+- `uart_init()`
+- `uart_set_baudrate(..., 115200)`
+- `uart_set_parity(..., UART_PARITY_NONE)`
+
+当前默认：
+
+- `kEnableUartTelemetry = true`
+- `kUartBaudrate = 115200`
+
+### 7.3 发送频率
+
+不是每帧都发，而是：
+
+- `kUartTelemetryInterval = 2`
+
+也就是隔帧发，避免串口本身拖慢主流程。
+
+### 7.4 发包长度限制
+
+考虑了 UART FIFO 只有 32 字节的限制。
+
+当前发送时会按：
+
+- `kUartSendMaxChunk = 32`
+
+自动分包发送。
+
+### 7.5 当前协议
+
+帧格式：
+
+```text
+AA 55 | version | msg_type | payload_len(LE) | payload | crc16(LE)
+```
+
+固定字段：
+
+- `magic0 = 0xAA`
+- `magic1 = 0x55`
+- `version = 0x01`
+- `msg_type = 0x01`
+
+当前 payload 是 `EyeGestureTelemetry`：
+
+1. `frame_id` `uint32 LE`
+2. `timestamp_ms` `uint32 LE`
+3. `left_valid` `uint8`
+4. `right_valid` `uint8`
+5. `gesture_valid` `uint8`
+6. `gesture_cls` `uint8`
+7. `left_cx_q8` `uint16 LE`
+8. `left_cy_q8` `uint16 LE`
+9. `right_cx_q8` `uint16 LE`
+10. `right_cy_q8` `uint16 LE`
+11. `gesture_score_q10` `uint16 LE`
+
+换算规则：
+
+- 眼动坐标：`q8 / 8.0`
+- 手势分数：`q10 / 1024.0`
+
+---
+
+## 8. 上位机对应关系
+
+当前这个串口协议已经对应了：
+
+- `D:\jichuangsai\vision_a1`
+
+那边是一个 `Node + 本地网页` 的可视化小工具。
+
+如果你后面改了这里的协议字段顺序、长度或者缩放系数，上位机的 `shared/protocol.js` 也要一起改。
+
+---
+
+## 9. 当前实时策略
+
+当前为了平衡识别效果和帧率，策略大致是：
+
+- 主线程只保最新帧
+- 人脸稳态低频
+- 眼睛稳态隔帧
+- 手势稳定后降频
+- OSD 不连续重刷
+- 串口隔帧发包
+
+从代码角度看，瓶颈现在主要还是：
+
+1. 双路取图
+2. `copy_double_tensor_buffer`
+3. `start_isp_debug_load`
+4. 眼睛检测 + 瞳孔精定位
+
+OSD 现在已经不是最大的开销来源。
+
+---
+
+## 10. 运行方式
+
+### 板端运行
+
+在 `scripts/run.sh` 里会做：
+
+1. 尝试加载 UART 驱动
+2. 启动 `ssne_ai_demo`
+
+所以正常板端启动还是走原来的脚本。
+
+### 编译注意
+
+当前工程已经依赖：
+
+- `libssne.so`
+- `libcmabuffer.so`
+- `libosd.so`
+- `libuart.so`
+- `libsszlog.so`
+- `libzlog.so`
+- `libemb.so`
+
+如果后面有人裁库或者拷工程，一定别漏了 `libuart.so`。
+
+---
+
+## 11. 后面常改的地方
+
+如果只是要继续调效果，通常会改下面这些：
+
+### 调眼动
+
+看 `demo_face.cpp` 里这些：
+
+- `kKalmanQPos`
+- `kKalmanQVel`
+- `kKalmanRCalm`
+- `kKalmanRActive`
+- `kResidualThresh`
+- `kEyeOutputDeadzonePx`
+- `kEyeOutputMotionScalePx`
+- `kEyeOutputSmoothAlphaCalm`
+- `kEyeOutputSmoothAlphaActive`
+
+### 调手势
+
+看这些：
+
+- `kPoseDisplayScoreThreshold`
+- `kPoseDisplayScoreThresholdTracked`
+- `kPoseDisplayScoreThresholdSwitch`
+- `kPoseOkMetricBias`
+- `kPoseOkThresholdRelax`
+
+### 调串口
+
+看这些：
+
+- `kEnableUartTelemetry`
+- `kUartBaudrate`
+- `kUartTelemetryInterval`
+
+---
