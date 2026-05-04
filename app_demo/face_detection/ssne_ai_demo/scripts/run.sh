@@ -13,5 +13,9 @@ if [ ! -f "$APP_BIN" ]; then
     exit 1
 fi
 
+if [ -f "/lib/modules/$(uname -r)/extra/uart_kmod.ko" ]; then
+    insmod "/lib/modules/$(uname -r)/extra/uart_kmod.ko" 2>/dev/null || true
+fi
+
 chmod +x "$APP_BIN"
 exec "$APP_BIN"

@@ -29,6 +29,8 @@
 #include <queue>
 #include <utility>
 #include <limits>
+#include <vector>
+#include "uart_api.h"
 #include "include/utils.hpp"
 
 using namespace std;
@@ -40,6 +42,8 @@ std::atomic<bool> stop_inference(false);         // 停止推理标志
 std::atomic<int> frame_count(0);                 // 帧计数器
 std::atomic<int> g_eye_draw_mode(1);             // 0: circle, 1: box
 VISUALIZER* g_visualizer = nullptr;              // 全局可视化器指针
+uart_handle_t g_uart_handle = nullptr;           // UART句柄
+std::mutex g_uart_mtx;                           // UART发送互斥，避免多线程交错发包
 
 namespace {
 // ============================================================================
@@ -93,10 +97,14 @@ constexpr float kPoseOkFastAcquireScore = 0.74f;          // OK 高分时快速�
 constexpr float kPoseOkSwitchInMarginRelax = 0.04f;       // 切入 OK 时降低门槛
 constexpr float kPoseOkSwitchOutExtraMargin = 0.06f;      // 从 OK 切走时提高门槛
 constexpr int   kPoseOkSwitchOutConfirmFrames = 3;        // 从 OK 切走时需要更多确认
+constexpr bool  kEnableUartTelemetry = true;              // 串口遥测开关
+constexpr uint32_t kUartBaudrate = 115200;                // 串口波特率
+constexpr int   kUartSendMaxChunk = 32;                   // 单次发送不超过UART FIFO大小
+constexpr int   kUartTelemetryInterval = 2;               // 遥测发送间隔帧数
 
 // ============================================================================
-// Kalman滤波参数（针对CPU高精度亚像素坐标，必须大幅干掉R以消除延迟！）
-// CPU直接算出来的是精准质心，所以 R 应当极小，否则会导致滞后(漂移)
+// Kalman滤波参数
+// CPU直接算出来的是精准质心，所以 R 应当极小，否则会导致滞后
 // ============================================================================
 constexpr float kKalmanQPos = 3.2f;      // 位置过程噪声，提高跟手性
 constexpr float kKalmanQVel = 0.9f;      // 速度过程噪声
@@ -1425,6 +1433,147 @@ std::array<float, 4> BuildEyeDotBox(const std::array<float, 4>& eye_box, float i
     out[3] = std::max(0.0f, std::min(out[3], img_h - 1.0f));
     return out;
 }
+
+enum : uint8_t {
+    kTelemetryMagic0 = 0xAA,
+    kTelemetryMagic1 = 0x55,
+    kTelemetryVersion = 0x01,
+    kTelemetryMsgEyeGesture = 0x01
+};
+
+struct EyeGestureTelemetry {
+    uint32_t frame_id = 0;
+    uint32_t timestamp_ms = 0;
+    uint8_t left_valid = 0;
+    uint8_t right_valid = 0;
+    uint8_t gesture_valid = 0;
+    uint8_t gesture_cls = 0xFF;
+    uint16_t left_cx_q8 = 0;
+    uint16_t left_cy_q8 = 0;
+    uint16_t right_cx_q8 = 0;
+    uint16_t right_cy_q8 = 0;
+    uint16_t gesture_score_q10 = 0;
+};
+
+uint16_t ClampToU16(float value, float scale) {
+    const float scaled = std::max(0.0f, value * scale);
+    return static_cast<uint16_t>(std::min(65535.0f, std::round(scaled)));
+}
+
+float BoxCenterXTelemetry(const std::array<float, 4>& box) {
+    return 0.5f * (box[0] + box[2]);
+}
+
+float BoxCenterYTelemetry(const std::array<float, 4>& box) {
+    return 0.5f * (box[1] + box[3]);
+}
+
+void AppendU8(std::vector<uint8_t>* buf, uint8_t value) {
+    buf->push_back(value);
+}
+
+void AppendU16LE(std::vector<uint8_t>* buf, uint16_t value) {
+    buf->push_back(static_cast<uint8_t>(value & 0xFF));
+    buf->push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+}
+
+void AppendU32LE(std::vector<uint8_t>* buf, uint32_t value) {
+    buf->push_back(static_cast<uint8_t>(value & 0xFF));
+    buf->push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    buf->push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    buf->push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+uint16_t Crc16Ccitt(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((crc & 0x8000U) != 0U) {
+                crc = static_cast<uint16_t>((crc << 1) ^ 0x1021U);
+            } else {
+                crc = static_cast<uint16_t>(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+std::vector<uint8_t> BuildEyeGesturePacket(const EyeGestureTelemetry& telem) {
+    std::vector<uint8_t> payload;
+    payload.reserve(24);
+    AppendU32LE(&payload, telem.frame_id);
+    AppendU32LE(&payload, telem.timestamp_ms);
+    AppendU8(&payload, telem.left_valid);
+    AppendU8(&payload, telem.right_valid);
+    AppendU8(&payload, telem.gesture_valid);
+    AppendU8(&payload, telem.gesture_cls);
+    AppendU16LE(&payload, telem.left_cx_q8);
+    AppendU16LE(&payload, telem.left_cy_q8);
+    AppendU16LE(&payload, telem.right_cx_q8);
+    AppendU16LE(&payload, telem.right_cy_q8);
+    AppendU16LE(&payload, telem.gesture_score_q10);
+
+    std::vector<uint8_t> packet;
+    packet.reserve(payload.size() + 8);
+    AppendU8(&packet, kTelemetryMagic0);
+    AppendU8(&packet, kTelemetryMagic1);
+    AppendU8(&packet, kTelemetryVersion);
+    AppendU8(&packet, kTelemetryMsgEyeGesture);
+    AppendU16LE(&packet, static_cast<uint16_t>(payload.size()));
+    packet.insert(packet.end(), payload.begin(), payload.end());
+    const uint16_t crc = Crc16Ccitt(packet.data(), packet.size());
+    AppendU16LE(&packet, crc);
+    return packet;
+}
+
+void SendPacketUart(const std::vector<uint8_t>& packet) {
+    if (!kEnableUartTelemetry || g_uart_handle == nullptr || packet.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_uart_mtx);
+    for (size_t offset = 0; offset < packet.size(); offset += kUartSendMaxChunk) {
+        const uint32_t chunk =
+            static_cast<uint32_t>(std::min<size_t>(kUartSendMaxChunk, packet.size() - offset));
+        uart_send_data(g_uart_handle,
+                       UART_TX0,
+                       const_cast<uint8_t*>(&packet[offset]),
+                       chunk);
+    }
+}
+
+void SendEyeGestureTelemetry(const std::vector<std::array<float, 4>>& stable_boxes,
+                             bool has_pose_overlay,
+                             int frame_id) {
+    if (!kEnableUartTelemetry || (frame_id % kUartTelemetryInterval) != 0) {
+        return;
+    }
+
+    EyeGestureTelemetry telem;
+    const auto now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    telem.frame_id = static_cast<uint32_t>(frame_id);
+    telem.timestamp_ms = static_cast<uint32_t>(now_ms & 0xFFFFFFFFu);
+
+    if (!stable_boxes.empty()) {
+        telem.left_valid = 1;
+        telem.left_cx_q8 = ClampToU16(BoxCenterXTelemetry(stable_boxes[0]), 8.0f);
+        telem.left_cy_q8 = ClampToU16(BoxCenterYTelemetry(stable_boxes[0]), 8.0f);
+    }
+    if (stable_boxes.size() > 1) {
+        telem.right_valid = 1;
+        telem.right_cx_q8 = ClampToU16(BoxCenterXTelemetry(stable_boxes[1]), 8.0f);
+        telem.right_cy_q8 = ClampToU16(BoxCenterYTelemetry(stable_boxes[1]), 8.0f);
+    }
+    if (has_pose_overlay && g_pose_track.active) {
+        telem.gesture_valid = 1;
+        telem.gesture_cls = static_cast<uint8_t>(std::max(0, g_pose_track.cls));
+        telem.gesture_score_q10 = ClampToU16(g_pose_track.score, 1024.0f);
+    }
+
+    SendPacketUart(BuildEyeGesturePacket(telem));
+}
 }
 
 
@@ -1588,6 +1737,8 @@ void inference_thread_func(POSEDETGRAY* pose_detector,
             }
         }
 
+        SendEyeGestureTelemetry(stable_boxes, has_pose_overlay, img_pair.frame_id);
+
         std::vector<std::array<float, 4>> box_draw;
         std::vector<int> box_draw_classes;
         if (has_face_roi) {
@@ -1663,6 +1814,9 @@ int main(int argc, char* argv[]) {
     string path_face_det = "/app_demo/app_assets/models/face_640x480.m1model";
     g_eye_draw_mode = 0;
     printf("[INFO] Eye draw mode: circle (forced)\n");
+    printf("[INFO] UART telemetry: %s, baud=%u\n",
+           kEnableUartTelemetry ? "enabled" : "disabled",
+           static_cast<unsigned int>(kUartBaudrate));
     printf("[INFO] Pose class colors: up->1 ok->2 down->3\n");
     printf("[INFO] Pose thresholds: acquire=%.2f tracked=%.2f switch=%.2f immediate=%.2f\n",
            kPoseDisplayScoreThreshold,
@@ -1675,6 +1829,18 @@ int main(int argc, char* argv[]) {
     
     if (ssne_initial()) {
         fprintf(stderr, "SSNE initialization failed!\n");
+    }
+
+    if (kEnableUartTelemetry) {
+        g_uart_handle = uart_init();
+        if (g_uart_handle == nullptr) {
+            fprintf(stderr, "[WARN] UART init failed, telemetry disabled.\n");
+        } else {
+            uart_set_baudrate(g_uart_handle, UART_TX0, kUartBaudrate);
+            uart_set_baudrate(g_uart_handle, UART_RX0, kUartBaudrate);
+            uart_set_parity(g_uart_handle, UART_TX0, UART_PARITY_NONE);
+            uart_set_parity(g_uart_handle, UART_RX0, UART_PARITY_NONE);
+        }
     }
     
     array<int, 2> img_shape = {img_width, img_height};
@@ -1775,6 +1941,10 @@ int main(int argc, char* argv[]) {
     eye_detector.Release();
     processor.Release();
     visualizer.Release();
+    if (g_uart_handle != nullptr) {
+        uart_close(g_uart_handle);
+        g_uart_handle = nullptr;
+    }
     
     if (ssne_release()) {
         fprintf(stderr, "SSNE release failed!\n");
