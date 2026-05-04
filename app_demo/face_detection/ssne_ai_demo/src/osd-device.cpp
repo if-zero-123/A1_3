@@ -122,13 +122,11 @@ void OsdDevice::Draw(std::vector<OsdQuadRangle> &quad_rangle, int layer_id){
         osd_clean_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id);
         return;
     }
-    int ret = 0;
-
     // generate qrangle box
     for(auto &q : quad_rangle){
         GenQrangleBox(q.box, q.border);
         COVER_ATTR_S qrangle_attr = {q.color, q.type, q.alpha, m_qrangle_out, m_qrangle_in};
-        ret = osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);   
+        osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);   
     }
     
     // flush data to ddr
@@ -142,12 +140,11 @@ void OsdDevice::Draw(std::vector<std::array<float, 4>>& boxes, int border, int l
         return;
     }
     
-    int ret = 0;
     // generate qrangle box
     for (auto &box : boxes){
         GenQrangleBox(box, border);
         COVER_ATTR_S qrangle_attr = {color, type, alpha, m_qrangle_out, m_qrangle_in};
-        ret = osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);                  
+        osd_add_quad_rangle_layer(m_osd_handle, (ssLAYER_HANDLE)layer_id, &qrangle_attr);                  
     }
     
     // flush data to ddr

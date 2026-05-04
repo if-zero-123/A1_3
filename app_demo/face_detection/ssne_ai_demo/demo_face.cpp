@@ -52,8 +52,10 @@ constexpr float kEyeMinBoxSize = 3.0f;             // 过滤极小框
 constexpr int   kEyeHoldFrames = 0;                // 丢检不保持，避免预测漂移
 constexpr int   kEyeInferIntervalStable = 2;       // 眼球稳定后隔帧检测，提升整体帧率
 constexpr float kEyeTrackActiveSpeedPx = 0.85f;    // 运动较快时恢复每帧检测
-constexpr int   kClearAfterMissFrames = 3;          // 连续空帧后清屏，避免残留漂移
+constexpr int   kClearAfterMissFrames = 5;          // 连续空帧后再清屏，减少闪烁
 constexpr float kEyeDotFixedRadius = 3.0f;          // 固定眼点半径（缩小为原来的3像素，避免过大遮挡）
+constexpr float kEyeLeftRightSplitBias = 0.08f;     // 左右眼按半区优先匹配，降低串眼
+constexpr float kEyeLeftTrackStabilityBias = 0.05f; // 左眼匹配额外稳定偏置
 constexpr float kEyeOutputDeadzonePx = 0.18f;       // 仅抑制极轻微抖动
 constexpr float kEyeOutputMotionScalePx = 0.70f;    // 小位移后就快速跟随
 constexpr float kEyeOutputSmoothAlphaCalm = 0.82f;  // 静态也尽量贴近真实中心
@@ -113,7 +115,8 @@ constexpr float kTrackAreaRatioMax = 2.80f;
 constexpr float kOutputSnapGrid = 1.0f;    // 坐标取整到像素
 
 // OSD 重绘参数（移除限频，仅保留位移门控）
-constexpr float kRedrawMinDelta = 2.0f;     // 提高重绘门槛，降低闪烁和OSD负载
+constexpr float kRedrawMinDelta = 3.2f;     // 提高重绘门槛，降低闪烁和OSD负载
+constexpr int   kOsdMinRedrawFrameGap = 3;  // 至少隔2帧再刷新一次OSD
 
 // 中值预滤波已移除：它增加 1-2 帧延迟，用残差自适应 Kalman 替代
 
@@ -944,7 +947,7 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float blob_h = static_cast<float>(max_ry - min_ry + 1);
             const float aspect = blob_w / std::max(1.0f, blob_h);
             
-            // 宽容的高宽比：哪怕眯眼、极度侧视，也不能丢！
+            // 宽容的高宽比
             if (aspect < 0.15f || aspect > 4.00f) {
                 continue;
             }
@@ -962,7 +965,7 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             const float dy = cy - roi_cy;
             const float dist2 = dx * dx + dy * dy;
 
-            // 回归以“极暗度”为主，辅以面积，弱化距离惩罚（让瞳孔能走到视线边缘）
+            // 回归以“极暗度”为主，辅以面积，弱化距离惩罚
             float score = (255.0f - mean_dark) * std::sqrt(static_cast<float>(area)) * fill_ratio /
                           (1.0f + 0.002f * dist2);
 
@@ -975,7 +978,7 @@ bool FindPupilCenterFromDarkBlob(const uint8_t* y_plane,
             float confidence =
                 0.45f * darkness_quality + 0.30f * fill_ratio + 0.15f * area_quality + 0.10f * center_quality;
                           
-            // 触碰边界的稍微扣分（因为眼框裁取得很紧凑，真的瞳孔是有可能贴边的）
+            // 触碰边界的稍微扣分
             if (touches_border) {
                 score *= 0.65f;
                 confidence *= 0.82f;
@@ -1085,6 +1088,10 @@ float CenterX(const std::array<float, 4>& box) {
     return 0.5f * (box[0] + box[2]);
 }
 
+float CenterY(const std::array<float, 4>& box) {
+    return 0.5f * (box[1] + box[3]);
+}
+
 std::vector<std::array<float, 4>> SortByCenterX(std::vector<std::array<float, 4>> boxes) {
     std::sort(boxes.begin(), boxes.end(), [](const std::array<float, 4>& a,
                                              const std::array<float, 4>& b) {
@@ -1142,6 +1149,26 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
                 continue;
             }
         }
+
+        if (has_track) {
+            const float box_cx = CenterX(box);
+            const float box_cy = CenterY(box);
+            const int preferred_track = (box_cx < 0.5f * static_cast<float>(img_w)) ? 0 : 1;
+            if (g_eye_tracks[preferred_track].IsReady()) {
+                const float track_cx = CenterX(g_eye_tracks[preferred_track].ToDisplayBox());
+                const float track_cy = CenterY(g_eye_tracks[preferred_track].ToDisplayBox());
+                const float max_side_shift = std::max(8.0f, kEyeLeftRightSplitBias * static_cast<float>(img_w));
+                const float max_vertical_shift = std::max(18.0f, 0.12f * static_cast<float>(img_h));
+                const bool side_ok =
+                    (preferred_track == 0) ? (box_cx <= track_cx + max_side_shift)
+                                           : (box_cx >= track_cx - max_side_shift);
+                const bool vertical_ok = std::fabs(box_cy - track_cy) <= max_vertical_shift;
+                if (!side_ok && !vertical_ok) {
+                    continue;
+                }
+            }
+        }
+
         std::array<float, 4> refined_box;
         if (RefineEyeBoxByCpuPupil(box, y_plane, img_w, img_h, &refined_box)) {
             box = refined_box;
@@ -1182,8 +1209,16 @@ std::vector<std::array<float, 4>> GetStableEyeBoxes(
                     continue;
                 }
             }
+            float match_bonus = 0.0f;
+            const float det_cx = CenterX(det_boxes[d]);
+            const float pred_cx = CenterX(predicted);
+            if (t == 0 && det_cx <= pred_cx + std::max(6.0f, kEyeLeftRightSplitBias * static_cast<float>(img_w) * 0.5f)) {
+                match_bonus += kEyeLeftTrackStabilityBias;
+            } else if (t == 1 && det_cx >= pred_cx - std::max(6.0f, kEyeLeftRightSplitBias * static_cast<float>(img_w) * 0.5f)) {
+                match_bonus += 0.03f;
+            }
             if (iou > best_score) {
-                best_score = iou;
+                best_score = iou + match_bonus;
                 best_d = d;
             }
         }
@@ -1247,6 +1282,9 @@ bool ShouldRedraw(const std::vector<std::array<float, 4>>& boxes,
                   const std::vector<int>* class_ids,
                   int frame_id) {
     if (g_last_draw_frame < 0) return true;
+    if ((frame_id - g_last_draw_frame) < kOsdMinRedrawFrameGap) {
+        return false;
+    }
     if (boxes.size() != g_last_drawn_boxes.size()) return true;
     if (class_ids != nullptr) {
         if (class_ids->size() != g_last_drawn_classes.size()) return true;
@@ -1575,8 +1613,10 @@ void inference_thread_func(POSEDETGRAY* pose_detector,
             if (g_visualizer != nullptr && g_has_active_overlay &&
                 g_consecutive_empty_frames >= kPoseClearAfterMissFrames) {
                 std::vector<std::array<float, 4>> empty;
-                g_visualizer->Draw(empty);
-                g_visualizer->DrawCircles(empty);
+                if ((img_pair.frame_id - g_last_draw_frame) >= kOsdMinRedrawFrameGap) {
+                    g_visualizer->Draw(empty);
+                    g_visualizer->DrawCircles(empty);
+                }
                 g_has_active_overlay = false;
                 g_last_drawn_boxes.clear();
                 g_last_drawn_classes.clear();
